@@ -7904,7 +7904,13 @@ fn should_repair_fallback_fts_after_full_index_run(
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
 ) -> bool {
-    full_rebuild && !canonical_only_full_rebuild
+    full_rebuild && !canonical_only_full_rebuild && fallback_fts_auto_repair_enabled()
+}
+
+fn fallback_fts_auto_repair_enabled() -> bool {
+    dotenvy::var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11401,44 +11407,9 @@ pub fn run_index(
         tracing::warn!(
             db_path = %opts.db_path.display(),
             error = %err,
-            "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
+            "derived fallback FTS metadata is inconsistent; continuing without DB-resident FTS repair because Tantivy is authoritative"
         );
-        storage.close_best_effort_in_place();
-        let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-            &opts.db_path,
-            Duration::from_secs(10),
-        )
-        .with_context(|| {
-            format!(
-                "opening fresh storage for fallback FTS repair before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        let repair = repair_storage.ensure_search_fallback_fts_consistency();
-        repair_storage.close_best_effort_in_place();
-        let repair = repair.with_context(|| {
-            format!(
-                "repairing derived fallback FTS before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        tracing::info!(
-            db_path = %opts.db_path.display(),
-            ?repair,
-            "derived fallback FTS repair completed before index pipeline"
-        );
-        storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-            &opts.db_path,
-            Duration::from_secs(10),
-        )
-        .with_context(|| {
-            format!(
-                "reopening storage after fallback FTS repair before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+        storage.disable_db_resident_fts_maintenance_for_process();
     }
 
     if opts.full
@@ -12556,6 +12527,13 @@ pub fn run_index(
                     "skipping fallback FTS consistency repair because this no-op full run preserved an archive fingerprint already known to be healthy"
                 );
             }
+            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::Skipped { reason }) => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    ?reason,
+                    "skipping fallback FTS consistency repair after full index run"
+                );
+            }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
@@ -12586,7 +12564,8 @@ pub fn run_index(
         tracing::info!(
             db_path = %opts.db_path.display(),
             canonical_only_full_rebuild,
-            "skipping frankensqlite-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
+            auto_repair_enabled = fallback_fts_auto_repair_enabled(),
+            "skipping frankensqlite-owned fallback FTS rebuild after full index run"
         );
     }
 
@@ -15250,6 +15229,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -15266,6 +15246,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -35047,9 +35028,13 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fts_repair_is_skipped_for_canonical_only_full_rebuild() {
+    #[serial]
+    fn fallback_fts_repair_is_disabled_by_default() {
+        let _guard = unset_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR");
         assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
-        assert!(should_repair_fallback_fts_after_full_index_run(true, false));
+        assert!(!should_repair_fallback_fts_after_full_index_run(
+            true, false
+        ));
         assert!(!should_repair_fallback_fts_after_full_index_run(
             false, false
         ));
@@ -35059,7 +35044,20 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn fallback_fts_repair_can_be_enabled_explicitly() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
+        assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
+        assert!(should_repair_fallback_fts_after_full_index_run(true, false));
+        assert!(!should_repair_fallback_fts_after_full_index_run(
+            false, false
+        ));
+    }
+
+    #[test]
+    #[serial]
     fn full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-healthy.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -35078,7 +35076,9 @@ mod tests {
     }
 
     #[test]
-    fn full_run_fallback_fts_repair_rebuilds_missing_schema_when_needed() {
+    #[serial]
+    fn full_run_fallback_fts_repair_skips_missing_schema() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-missing.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -35090,13 +35090,17 @@ mod tests {
         assert_eq!(
             repair,
             Some(FallbackFtsRepairOutcome::Repaired(
-                FtsConsistencyRepair::Rebuilt { inserted_rows: 4 }
+                FtsConsistencyRepair::Skipped {
+                    reason: crate::storage::sqlite::FtsConsistencySkipReason::Absent
+                }
             ))
         );
     }
 
     #[test]
+    #[serial]
     fn full_run_fallback_fts_repair_skips_known_healthy_archive_fingerprint() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-known-healthy.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
