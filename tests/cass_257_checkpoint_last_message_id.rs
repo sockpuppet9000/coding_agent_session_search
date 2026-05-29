@@ -427,6 +427,83 @@ fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> Te
 }
 
 #[test]
+fn models_backfill_appends_new_messages_in_existing_conversation() -> TestResult {
+    let workdir = TempDir::new()?;
+    let data_dir = workdir.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = workdir.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path)?;
+    let agent_id = storage.ensure_agent(&sample_agent())?;
+    for idx in 1..=20 {
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &sample_conversation(
+                &format!("existing-seed-{idx:02}"),
+                &format!("existing append seed conversation {idx:02}"),
+            ),
+        )?;
+    }
+    let old_fingerprint = content_fingerprint(&storage)?;
+
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut manifest = SemanticManifest::default();
+    let initial = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: old_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(initial.published);
+    assert_eq!(initial.embedded_docs, 20);
+
+    storage.raw().execute(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json)
+         VALUES(1, 1, 'assistant', NULL, 1700000001500, 'new message in existing conversation', '{}')",
+    )?;
+    let new_fingerprint = content_fingerprint(&storage)?;
+    assert_ne!(old_fingerprint, new_fingerprint);
+    assert!(
+        new_fingerprint.starts_with("content-v1:20:20:"),
+        "fixture should change only max_message_id; got {new_fingerprint}"
+    );
+
+    let appended = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: new_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+
+    assert!(appended.published);
+    assert_eq!(
+        appended.embedded_docs, 1,
+        "append-only refresh must embed messages added to an existing conversation"
+    );
+    let artifact = manifest.fast_tier.as_ref().expect("fast tier artifact");
+    assert_eq!(artifact.db_fingerprint, new_fingerprint);
+    assert_eq!(
+        artifact.doc_count, 21,
+        "published doc_count must include the appended existing-conversation message"
+    );
+    assert_eq!(artifact.conversation_count, 20);
+
+    Ok(())
+}
+
+#[test]
 fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResult {
     let workdir = TempDir::new()?;
     let data_dir = workdir.path().join("data");

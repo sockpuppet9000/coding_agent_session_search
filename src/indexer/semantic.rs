@@ -1382,29 +1382,42 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
     })
 }
 
-fn packet_embedding_inputs_from_storage_after_conversation(
+fn packet_embedding_inputs_from_storage_after_content_fingerprint(
     storage: &FrankenStorage,
-    after_conversation_id: i64,
+    artifact_fingerprint: SemanticContentFingerprint,
 ) -> Result<CanonicalIncrementalEmbeddingBatch> {
     let conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(
             "SELECT c.id
              FROM conversations c
-             WHERE c.id > ?1
-               AND EXISTS (
+             WHERE (
+                   c.id > ?1
+                   AND EXISTS (
+                       SELECT 1
+                       FROM messages
+                       WHERE conversation_id = c.id
+                       LIMIT 1
+                   )
+               )
+               OR EXISTS (
                    SELECT 1
                    FROM messages
                    WHERE conversation_id = c.id
+                     AND id > ?2
                    LIMIT 1
                )
              ORDER BY c.id ASC",
-            &[ParamValue::from(after_conversation_id)],
+            &[
+                ParamValue::from(artifact_fingerprint.max_conversation_id),
+                ParamValue::from(artifact_fingerprint.max_message_id),
+            ],
             |row| row.get_typed(0),
         )
         .with_context(|| {
             format!(
-                "fetching canonical semantic append-only conversation ids after conversation {after_conversation_id}"
+                "fetching canonical semantic append-only conversation ids after fingerprint {:?}",
+                artifact_fingerprint
             )
         })?;
 
@@ -1416,15 +1429,48 @@ fn packet_embedding_inputs_from_storage_after_conversation(
         });
     }
 
-    let (inputs, raw_max_message_id) = packet_embedding_inputs_from_selected_canonical_messages(
-        storage,
-        &conversation_ids,
-        |_| true,
-    )?;
+    let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
+    let mut grouped_messages =
+        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let mut inputs = Vec::new();
+    let mut raw_max_message_id: Option<i64> = None;
+    let mut conversations_in_batch = 0u64;
 
-    let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
+    for conversation in &conversations {
+        let mut messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        messages.retain(|message| {
+            let keep = if conversation.conversation_id > artifact_fingerprint.max_conversation_id {
+                true
+            } else {
+                message
+                    .id
+                    .is_some_and(|id| id > artifact_fingerprint.max_message_id)
+            };
+            if keep && let Some(message_id) = message.id {
+                raw_max_message_id =
+                    Some(raw_max_message_id.map_or(message_id, |current| current.max(message_id)));
+            }
+            keep
+        });
+        if messages.is_empty() {
+            continue;
+        }
+
+        conversations_in_batch = conversations_in_batch.saturating_add(1);
+        let provenance = canonical_embedding_packet_provenance(conversation);
+        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        inputs.extend(embedding_inputs_from_conversation_packet(
+            conversation,
+            &packet,
+        ));
+    }
+
     tracing::debug!(
-        after_conversation_id,
+        max_conversation_id = artifact_fingerprint.max_conversation_id,
+        max_message_id = artifact_fingerprint.max_message_id,
         conversations_in_batch,
         packet_driven = true,
         semantic_inputs = inputs.len(),
@@ -2507,9 +2553,9 @@ impl SemanticIndexer {
             return Ok(None);
         }
 
-        let batch = packet_embedding_inputs_from_storage_after_conversation(
+        let batch = packet_embedding_inputs_from_storage_after_content_fingerprint(
             storage,
-            artifact_fingerprint.max_conversation_id,
+            artifact_fingerprint,
         )?;
         let expected_current_docs = artifact
             .doc_count
