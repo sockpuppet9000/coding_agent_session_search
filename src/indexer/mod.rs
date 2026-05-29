@@ -78,7 +78,9 @@ use crate::storage::sqlite::{
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
-    packet_embedding_inputs_from_storage_since,
+    packet_embedding_inputs_from_storage_after_content_fingerprint,
+    packet_embedding_inputs_from_storage_since, parse_semantic_content_fingerprint,
+    semantic_artifact_is_append_only_prefix,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -13120,13 +13122,6 @@ impl WatchSemanticDelta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SemanticContentFingerprint {
-    total_conversations: usize,
-    max_conversation_id: i64,
-    max_message_id: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetedSemanticWatchOnceMode {
     RebuildAll,
     AppendToExisting,
@@ -13156,21 +13151,6 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
-}
-
-fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
-    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
-    let total_conversations = parts.next()?.parse::<usize>().ok()?;
-    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
-    let max_message_id = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SemanticContentFingerprint {
-        total_conversations,
-        max_conversation_id,
-        max_message_id,
-    })
 }
 
 fn semantic_artifact_for_tier(
@@ -13226,7 +13206,7 @@ fn semantic_watch_once_index_total_size_bytes(index_path: &Path) -> Result<u64> 
         Ok(meta) => {
             size = size.saturating_add(meta.len());
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind().eq(&std::io::ErrorKind::NotFound) => {}
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("stat semantic watch-once WAL {}", wal_path.display()));
@@ -13279,33 +13259,6 @@ fn validate_semantic_watch_once_artifact(
         );
     }
     Ok(index_path)
-}
-
-fn semantic_artifact_is_append_only_prefix(
-    storage: &FrankenStorage,
-    artifact_fingerprint: SemanticContentFingerprint,
-    current_fingerprint: SemanticContentFingerprint,
-) -> Result<bool> {
-    if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
-        || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
-        || artifact_fingerprint.max_message_id > current_fingerprint.max_message_id
-    {
-        return Ok(false);
-    }
-
-    let prefix_conversations: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*)
-             FROM conversations
-             WHERE id <= ?1",
-            &[ParamValue::from(artifact_fingerprint.max_conversation_id)],
-            |row| row.get_typed(0),
-        )
-        .context("checking semantic watch-once prefix conversation count")?;
-    let observed_prefix_conversations =
-        usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
-    Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
 }
 
 fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
@@ -13417,15 +13370,20 @@ fn select_targeted_semantic_watch_once_inputs(
         );
     }
     let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
-    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
-    {
+    if !semantic_artifact_is_append_only_prefix(
+        storage,
+        &artifact_fingerprint,
+        &current_fingerprint,
+    )? {
         anyhow::bail!(
             "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
         );
     }
 
-    let mut batch =
-        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
+    let mut batch = packet_embedding_inputs_from_storage_after_content_fingerprint(
+        storage,
+        &artifact_fingerprint,
+    )?;
     let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
         (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
     });

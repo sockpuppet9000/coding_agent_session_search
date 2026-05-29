@@ -11,21 +11,24 @@
 //! (no `last_message_id`) loads cleanly and the run falls back to
 //! the conversation offset.
 
-use std::error::Error;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::ensure;
 use coding_agent_search::indexer::semantic::{SemanticBackfillStoragePlan, SemanticIndexer};
 use coding_agent_search::indexer::semantic_progress::SemanticProgressSink;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::search::semantic_manifest::{BuildCheckpoint, SemanticManifest, TierKind};
+use coding_agent_search::search::semantic_manifest::{
+    ArtifactRecord, BuildCheckpoint, SemanticManifest, TierKind,
+};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+type TestResult<T = ()> = anyhow::Result<T>;
 
 fn sample_agent() -> Agent {
     Agent {
@@ -62,6 +65,35 @@ fn sample_conversation(external_id: &str, content: &str) -> Conversation {
         source_id: "local".to_string(),
         origin_host: None,
     }
+}
+
+fn sample_indexed_conversation(
+    external_prefix: &str,
+    content_prefix: &str,
+    idx: usize,
+) -> Conversation {
+    sample_conversation(
+        &format!("{external_prefix}-{idx:02}"),
+        &format!("{content_prefix} {idx:02}"),
+    )
+}
+
+fn missing_artifact(name: &'static str) -> io::Error {
+    io::Error::other(name)
+}
+
+fn fast_artifact(manifest: &SemanticManifest) -> TestResult<&ArtifactRecord> {
+    manifest
+        .fast_tier
+        .as_ref()
+        .ok_or_else(|| missing_artifact("missing fast artifact").into())
+}
+
+fn quality_artifact(manifest: &SemanticManifest) -> TestResult<&ArtifactRecord> {
+    manifest
+        .quality_tier
+        .as_ref()
+        .ok_or_else(|| missing_artifact("missing quality artifact").into())
 }
 
 fn seed_three_conversations(db_path: &Path) -> TestResult<FrankenStorage> {
@@ -254,11 +286,12 @@ fn resume_skips_messages_with_id_at_or_below_last_message_id() -> TestResult {
     assert!(third.published, "expected publication after third resume");
     assert_eq!(third.embedded_docs, 1);
 
+    resume_does_not_globally_filter_future_conversations_by_last_message_id_case()?;
+
     Ok(())
 }
 
-#[test]
-fn resume_does_not_globally_filter_future_conversations_by_last_message_id() -> TestResult {
+fn resume_does_not_globally_filter_future_conversations_by_last_message_id_case() -> TestResult {
     let workdir = TempDir::new()?;
     let data_dir = workdir.path().join("data");
     fs::create_dir_all(&data_dir)?;
@@ -289,11 +322,14 @@ fn resume_does_not_globally_filter_future_conversations_by_last_message_id() -> 
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(!first.published);
-    assert_eq!(first.embedded_docs, 1);
-    assert_eq!(
-        manifest.checkpoint.as_ref().and_then(|c| c.last_message_id),
-        Some(100),
+    ensure!(!first.published, "first batch should checkpoint");
+    ensure!(
+        first.embedded_docs == 1,
+        "first batch embedded wrong doc count"
+    );
+    let persisted_last_message_id = manifest.checkpoint.as_ref().and_then(|c| c.last_message_id);
+    ensure!(
+        persisted_last_message_id == Some(100),
         "fixture should persist the intentionally high first message id"
     );
 
@@ -309,12 +345,15 @@ fn resume_does_not_globally_filter_future_conversations_by_last_message_id() -> 
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(!second.published);
-    assert_eq!(
-        second.embedded_docs, 1,
+    ensure!(!second.published, "second batch should still checkpoint");
+    ensure!(
+        second.embedded_docs == 1,
         "conversation 2 must still be selected even though its message id is below the prior high-water mark"
     );
-    assert_eq!(second.last_offset, 2);
+    ensure!(
+        second.last_offset == 2,
+        "second batch advanced to wrong offset"
+    );
 
     let third = indexer.run_backfill_from_storage_with_sink(
         &storage,
@@ -328,17 +367,19 @@ fn resume_does_not_globally_filter_future_conversations_by_last_message_id() -> 
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(
+    ensure!(
         third.published,
         "third conversation should complete the tier"
     );
-    assert_eq!(third.embedded_docs, 1);
+    ensure!(
+        third.embedded_docs == 1,
+        "third batch embedded wrong doc count"
+    );
 
     Ok(())
 }
 
-#[test]
-fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> TestResult {
+fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint_case() -> TestResult {
     let workdir = TempDir::new()?;
     let data_dir = workdir.path().join("data");
     fs::create_dir_all(&data_dir)?;
@@ -349,10 +390,7 @@ fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> Te
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &sample_conversation(
-                &format!("seed-{idx:02}"),
-                &format!("append-only seed conversation {idx:02}"),
-            ),
+            &sample_indexed_conversation("seed", "append-only seed conversation", idx),
         )?;
     }
     let old_fingerprint = content_fingerprint(&storage)?;
@@ -371,14 +409,18 @@ fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> Te
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(initial.published);
-    assert_eq!(initial.embedded_docs, 20);
-    assert_eq!(
-        manifest
-            .fast_tier
-            .as_ref()
-            .map(|artifact| artifact.doc_count),
-        Some(20)
+    ensure!(initial.published, "initial backfill should publish");
+    ensure!(
+        initial.embedded_docs == 20,
+        "initial backfill embedded wrong count"
+    );
+    let initial_doc_count = manifest
+        .fast_tier
+        .as_ref()
+        .map(|artifact| artifact.doc_count);
+    ensure!(
+        initial_doc_count == Some(20),
+        "initial artifact recorded wrong doc count"
     );
 
     storage.insert_conversation_tree(
@@ -390,7 +432,10 @@ fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> Te
         .raw()
         .execute("UPDATE messages SET id = 0 WHERE conversation_id = 21")?;
     let new_fingerprint = content_fingerprint(&storage)?;
-    assert_ne!(old_fingerprint, new_fingerprint);
+    ensure!(
+        old_fingerprint != new_fingerprint,
+        "append-only fixture should change the content fingerprint"
+    );
 
     let appended = indexer.run_backfill_from_storage_with_sink(
         &storage,
@@ -405,20 +450,29 @@ fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> Te
         &SemanticProgressSink::disabled(),
     )?;
 
-    assert!(appended.published);
-    assert!(!appended.checkpoint_saved);
-    assert_eq!(
-        appended.embedded_docs, 1,
+    ensure!(appended.published, "append-only backfill should publish");
+    ensure!(
+        !appended.checkpoint_saved,
+        "append-only publish should not leave a checkpoint"
+    );
+    ensure!(
+        appended.embedded_docs == 1,
         "append-only refresh should embed only the new conversation"
     );
-    let artifact = manifest.fast_tier.as_ref().expect("fast tier artifact");
-    assert_eq!(artifact.db_fingerprint, new_fingerprint);
-    assert_eq!(
-        artifact.doc_count, 21,
+    let artifact = fast_artifact(&manifest)?;
+    ensure!(
+        artifact.db_fingerprint == new_fingerprint,
+        "artifact fingerprint should advance to append-only DB fingerprint"
+    );
+    ensure!(
+        artifact.doc_count == 21,
         "published doc_count must include un-compacted WAL entries"
     );
-    assert_eq!(artifact.conversation_count, 21);
-    assert!(
+    ensure!(
+        artifact.conversation_count == 21,
+        "artifact should record all conversations after append"
+    );
+    ensure!(
         manifest.checkpoint.is_none(),
         "append-only publish should leave no resumable checkpoint"
     );
@@ -426,8 +480,7 @@ fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> Te
     Ok(())
 }
 
-#[test]
-fn models_backfill_appends_new_messages_in_existing_conversation() -> TestResult {
+fn models_backfill_appends_new_messages_in_existing_conversation_case() -> TestResult {
     let workdir = TempDir::new()?;
     let data_dir = workdir.path().join("data");
     fs::create_dir_all(&data_dir)?;
@@ -438,10 +491,7 @@ fn models_backfill_appends_new_messages_in_existing_conversation() -> TestResult
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &sample_conversation(
-                &format!("existing-seed-{idx:02}"),
-                &format!("existing append seed conversation {idx:02}"),
-            ),
+            &sample_indexed_conversation("existing-seed", "existing append seed conversation", idx),
         )?;
     }
     let old_fingerprint = content_fingerprint(&storage)?;
@@ -460,16 +510,22 @@ fn models_backfill_appends_new_messages_in_existing_conversation() -> TestResult
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(initial.published);
-    assert_eq!(initial.embedded_docs, 20);
+    ensure!(initial.published, "initial backfill should publish");
+    ensure!(
+        initial.embedded_docs == 20,
+        "initial backfill embedded wrong count"
+    );
 
     storage.raw().execute(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json)
          VALUES(1, 1, 'assistant', NULL, 1700000001500, 'new message in existing conversation', '{}')",
     )?;
     let new_fingerprint = content_fingerprint(&storage)?;
-    assert_ne!(old_fingerprint, new_fingerprint);
-    assert!(
+    ensure!(
+        old_fingerprint != new_fingerprint,
+        "existing-message fixture should change the content fingerprint"
+    );
+    ensure!(
         new_fingerprint.starts_with("content-v1:20:20:"),
         "fixture should change only max_message_id; got {new_fingerprint}"
     );
@@ -487,24 +543,29 @@ fn models_backfill_appends_new_messages_in_existing_conversation() -> TestResult
         &SemanticProgressSink::disabled(),
     )?;
 
-    assert!(appended.published);
-    assert_eq!(
-        appended.embedded_docs, 1,
+    ensure!(appended.published, "append-only backfill should publish");
+    ensure!(
+        appended.embedded_docs == 1,
         "append-only refresh must embed messages added to an existing conversation"
     );
-    let artifact = manifest.fast_tier.as_ref().expect("fast tier artifact");
-    assert_eq!(artifact.db_fingerprint, new_fingerprint);
-    assert_eq!(
-        artifact.doc_count, 21,
+    let artifact = fast_artifact(&manifest)?;
+    ensure!(
+        artifact.db_fingerprint == new_fingerprint,
+        "artifact fingerprint should advance to existing-message DB fingerprint"
+    );
+    ensure!(
+        artifact.doc_count == 21,
         "published doc_count must include the appended existing-conversation message"
     );
-    assert_eq!(artifact.conversation_count, 20);
+    ensure!(
+        artifact.conversation_count == 20,
+        "existing-message append should not change conversation count"
+    );
 
     Ok(())
 }
 
-#[test]
-fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResult {
+fn models_backfill_reuses_sibling_tier_append_without_reembedding_case() -> TestResult {
     let workdir = TempDir::new()?;
     let data_dir = workdir.path().join("data");
     fs::create_dir_all(&data_dir)?;
@@ -515,10 +576,7 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &sample_conversation(
-                &format!("shared-seed-{idx:02}"),
-                &format!("shared append seed conversation {idx:02}"),
-            ),
+            &sample_indexed_conversation("shared-seed", "shared append seed conversation", idx),
         )?;
     }
     let old_fingerprint = content_fingerprint(&storage)?;
@@ -537,11 +595,11 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(initial.published);
+    ensure!(initial.published, "initial fast backfill should publish");
 
-    let mut quality_artifact = manifest.fast_tier.as_ref().expect("fast artifact").clone();
-    quality_artifact.tier = TierKind::Quality;
-    manifest.quality_tier = Some(quality_artifact);
+    let mut cloned_quality_artifact = fast_artifact(&manifest)?.clone();
+    cloned_quality_artifact.tier = TierKind::Quality;
+    manifest.quality_tier = Some(cloned_quality_artifact);
 
     storage.insert_conversation_tree(
         agent_id,
@@ -565,14 +623,18 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(quality.published);
-    assert_eq!(quality.embedded_docs, 1);
-    assert_eq!(
-        manifest
-            .quality_tier
-            .as_ref()
-            .map(|artifact| artifact.doc_count),
-        Some(21)
+    ensure!(quality.published, "quality append should publish");
+    ensure!(
+        quality.embedded_docs == 1,
+        "quality append embedded wrong count"
+    );
+    let quality_doc_count = manifest
+        .quality_tier
+        .as_ref()
+        .map(|artifact| artifact.doc_count);
+    ensure!(
+        quality_doc_count == Some(21),
+        "quality artifact recorded wrong doc count after append"
     );
 
     let quality_again = indexer.run_backfill_from_storage_with_sink(
@@ -587,9 +649,12 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(quality_again.published);
-    assert_eq!(
-        quality_again.embedded_docs, 0,
+    ensure!(
+        quality_again.published,
+        "quality metadata refresh should publish"
+    );
+    ensure!(
+        quality_again.embedded_docs == 0,
         "current artifact with un-compacted WAL should be a metadata refresh, not a rebuild"
     );
 
@@ -619,17 +684,29 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(fast.published);
-    assert_eq!(
-        fast.embedded_docs, 0,
+    ensure!(fast.published, "fast sibling refresh should publish");
+    ensure!(
+        fast.embedded_docs == 0,
         "sibling tier should reuse the already appended WAL entries"
     );
-    assert!(manifest.checkpoint.is_none());
-    let fast_artifact = manifest.fast_tier.as_ref().expect("fast artifact");
-    let quality_artifact = manifest.quality_tier.as_ref().expect("quality artifact");
-    assert_eq!(fast_artifact.db_fingerprint, new_fingerprint);
-    assert_eq!(fast_artifact.doc_count, 21);
-    assert_eq!(quality_artifact.doc_count, 21);
+    ensure!(
+        manifest.checkpoint.is_none(),
+        "sibling reuse should clear stale checkpoint"
+    );
+    let fast_record = fast_artifact(&manifest)?;
+    let quality_record = quality_artifact(&manifest)?;
+    ensure!(
+        fast_record.db_fingerprint == new_fingerprint,
+        "fast artifact should adopt shared fingerprint"
+    );
+    ensure!(
+        fast_record.doc_count == 21,
+        "fast artifact doc count mismatch"
+    );
+    ensure!(
+        quality_record.doc_count == 21,
+        "quality artifact doc count mismatch"
+    );
 
     storage.insert_conversation_tree(
         agent_id,
@@ -650,8 +727,14 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(second_quality.published);
-    assert_eq!(second_quality.embedded_docs, 1);
+    ensure!(
+        second_quality.published,
+        "second quality append should publish"
+    );
+    ensure!(
+        second_quality.embedded_docs == 1,
+        "second quality append embedded wrong count"
+    );
 
     manifest.checkpoint = Some(BuildCheckpoint {
         tier: TierKind::Fast,
@@ -679,16 +762,28 @@ fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResul
         },
         &SemanticProgressSink::disabled(),
     )?;
-    assert!(second_fast.published);
-    assert_eq!(
-        second_fast.embedded_docs, 0,
+    ensure!(
+        second_fast.published,
+        "second fast sibling refresh should publish"
+    );
+    ensure!(
+        second_fast.embedded_docs == 0,
         "sibling tier should also reuse WAL when the old artifact doc_count already included an earlier WAL"
     );
-    let fast_artifact = manifest.fast_tier.as_ref().expect("fast artifact");
-    let quality_artifact = manifest.quality_tier.as_ref().expect("quality artifact");
-    assert_eq!(fast_artifact.db_fingerprint, second_fingerprint);
-    assert_eq!(fast_artifact.doc_count, 22);
-    assert_eq!(quality_artifact.doc_count, 22);
+    let fast_record = fast_artifact(&manifest)?;
+    let quality_record = quality_artifact(&manifest)?;
+    ensure!(
+        fast_record.db_fingerprint == second_fingerprint,
+        "fast artifact should adopt second shared fingerprint"
+    );
+    ensure!(
+        fast_record.doc_count == 22,
+        "second fast doc count mismatch"
+    );
+    ensure!(
+        quality_record.doc_count == 22,
+        "second quality doc count mismatch"
+    );
 
     Ok(())
 }
@@ -790,6 +885,10 @@ fn forward_compat_fallback_for_v1_shape_manifest_without_last_message_id() -> Te
         new_last_message_id.is_some(),
         "fresh checkpoint must persist last_message_id; got manifest {updated:#?}"
     );
+
+    models_backfill_appends_ready_artifact_for_append_only_db_fingerprint_case()?;
+    models_backfill_appends_new_messages_in_existing_conversation_case()?;
+    models_backfill_reuses_sibling_tier_append_without_reembedding_case()?;
 
     Ok(())
 }
