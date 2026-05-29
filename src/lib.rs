@@ -27853,17 +27853,6 @@ fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
         .unwrap_or_else(|| "[external]".to_string())
 }
 
-fn doctor_portable_relative_display(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
-            std::path::Component::CurDir => None,
-            other => Some(other.as_os_str().to_string_lossy().into_owned()),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn doctor_redacted_text(text: &str, data_dir: &Path) -> String {
     let data_dir_text = data_dir.display().to_string();
     text.replace(&data_dir_text, "[cass-data]")
@@ -27974,8 +27963,12 @@ fn doctor_forensic_bundle_id(operation_id: &str, created_at_ms: i64) -> String {
 }
 
 fn doctor_forensic_relative_path_is_safe(relative_path: &Path) -> bool {
-    let raw = relative_path.as_os_str().to_string_lossy();
-    !raw.contains('\\')
+    #[cfg(windows)]
+    let contains_forbidden_separator = false;
+    #[cfg(not(windows))]
+    let contains_forbidden_separator = relative_path.as_os_str().to_string_lossy().contains('\\');
+
+    !contains_forbidden_separator
         && !relative_path.as_os_str().is_empty()
         && !relative_path.is_absolute()
         && relative_path.components().all(|component| match component {
@@ -28029,15 +28022,6 @@ fn doctor_portable_relative_component_is_safe(name: &std::ffi::OsStr) -> bool {
             | "LPT8"
             | "LPT9"
     )
-}
-
-fn doctor_forensic_prefixed_relative_path(prefix: &str, relative_to_root: &Path) -> PathBuf {
-    let relative = doctor_portable_relative_display(relative_to_root);
-    if relative.is_empty() {
-        PathBuf::from(prefix)
-    } else {
-        PathBuf::from(format!("{prefix}/{relative}"))
-    }
 }
 
 fn doctor_forensic_bundle_root_is_safe(data_dir: &Path, root: &Path) -> Result<(), String> {
@@ -28579,8 +28563,7 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative =
-                doctor_forensic_prefixed_relative_path("raw-mirror-manifests", relative_to_root);
+            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -28613,8 +28596,7 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative =
-                doctor_forensic_prefixed_relative_path("index-manifests", relative_to_root);
+            let relative = Path::new("index-manifests").join(relative_to_root);
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
@@ -36839,7 +36821,7 @@ fn doctor_candidate_live_inventory(
 fn doctor_candidate_relative_path(candidate_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(candidate_dir)
         .ok()
-        .map(doctor_portable_relative_display)
+        .map(|relative| relative.display().to_string().replace('\\', "/"))
 }
 
 fn doctor_candidate_artifact_class(relative_path: &str) -> DoctorAssetClass {

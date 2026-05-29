@@ -26496,23 +26496,22 @@ mod tests {
         EnvGuard { key, previous }
     }
 
-    fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> String {
+    fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
         match std::fs::read_to_string(lock_path) {
-            Ok(raw) => raw,
+            Ok(raw) => Ok(raw),
             Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
                 let sidecar_path =
                     crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
-                std::fs::read_to_string(&sidecar_path).unwrap_or_else(|sidecar_err| {
-                    panic!(
-                        "failed to read locked index-run metadata sidecar {} after lock-file read failed with {err}: {sidecar_err}",
+                std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading locked index-run metadata sidecar {} after lock-file read failed with {err}",
                         sidecar_path.display()
                     )
                 })
             }
-            Err(err) => panic!(
-                "failed to read index-run lock metadata {}: {err}",
-                lock_path.display()
-            ),
+            Err(err) => Err(err).with_context(|| {
+                format!("reading index-run lock metadata {}", lock_path.display())
+            }),
         }
     }
 
@@ -26701,7 +26700,7 @@ mod tests {
         // key with a fresh timestamp. Parsing it lets a future change
         // to the field's value type surface as a precise test failure.
         let lock_path = tmp.path().join("index-run.lock");
-        let raw = read_index_run_lock_metadata_for_test(&lock_path);
+        let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
         let last_progress_lines: Vec<&str> = raw
             .lines()
             .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
@@ -26788,19 +26787,18 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() {
-        let tmp = TempDir::new().unwrap();
+    fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() -> Result<()> {
+        let tmp = TempDir::new()?;
         let db_path = tmp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"placeholder").unwrap();
-        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
-            .expect("acquire index run lock");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
         let lock_path = tmp.path().join("index-run.lock");
-        let before = read_index_run_lock_metadata_for_test(&lock_path);
+        let before = read_index_run_lock_metadata_for_test(&lock_path)?;
         let old_progress = before
             .lines()
             .find_map(|line| line.strip_prefix("last_progress_at_ms="))
             .and_then(|raw| raw.parse::<i64>().ok())
-            .expect("initial progress line");
+            .context("initial progress line")?;
         let bumped_progress = old_progress.saturating_add(1_000);
         guard
             .last_progress_at_ms_atomic
@@ -26810,16 +26808,16 @@ mod tests {
             tmp.path(),
             Some(&guard.metadata_write_lock),
             guard.last_progress_at_ms_atomic.load(Ordering::Relaxed),
-        )
-        .expect("heartbeat should persist indexer-owned progress");
+        )?;
 
-        let refreshed = read_index_run_lock_metadata_for_test(&lock_path);
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path)?;
         let expected_line = format!("last_progress_at_ms={bumped_progress}");
         assert!(
             refreshed.lines().any(|line| line == expected_line),
             "heartbeat must persist the indexer-owned progress bump, got {refreshed:?}"
         );
         drop(guard);
+        Ok(())
     }
 
     #[test]
