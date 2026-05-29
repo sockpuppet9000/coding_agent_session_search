@@ -3720,9 +3720,11 @@ mod tests {
         .expect("write lock metadata");
 
         let temp_path = temp.path().to_path_buf();
+        let release_lock_path = lock_path.clone();
         let release_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let _ = owner.set_len(0);
+            let _ = clear_index_run_lock_metadata_sidecar(&release_lock_path);
             let _ = FileExt::unlock(&owner);
             drop(owner);
         });

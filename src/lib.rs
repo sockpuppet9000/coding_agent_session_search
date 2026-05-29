@@ -27853,6 +27853,17 @@ fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
         .unwrap_or_else(|| "[external]".to_string())
 }
 
+fn doctor_portable_relative_display(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => None,
+            other => Some(other.as_os_str().to_string_lossy().into_owned()),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn doctor_redacted_text(text: &str, data_dir: &Path) -> String {
     let data_dir_text = data_dir.display().to_string();
     text.replace(&data_dir_text, "[cass-data]")
@@ -28018,6 +28029,15 @@ fn doctor_portable_relative_component_is_safe(name: &std::ffi::OsStr) -> bool {
             | "LPT8"
             | "LPT9"
     )
+}
+
+fn doctor_forensic_prefixed_relative_path(prefix: &str, relative_to_root: &Path) -> PathBuf {
+    let relative = doctor_portable_relative_display(relative_to_root);
+    if relative.is_empty() {
+        PathBuf::from(prefix)
+    } else {
+        PathBuf::from(format!("{prefix}/{relative}"))
+    }
 }
 
 fn doctor_forensic_bundle_root_is_safe(data_dir: &Path, root: &Path) -> Result<(), String> {
@@ -28559,7 +28579,8 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
+            let relative =
+                doctor_forensic_prefixed_relative_path("raw-mirror-manifests", relative_to_root);
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -28592,7 +28613,8 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("index-manifests").join(relative_to_root);
+            let relative =
+                doctor_forensic_prefixed_relative_path("index-manifests", relative_to_root);
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
@@ -36817,7 +36839,7 @@ fn doctor_candidate_live_inventory(
 fn doctor_candidate_relative_path(candidate_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(candidate_dir)
         .ok()
-        .map(|relative| relative.display().to_string())
+        .map(doctor_portable_relative_display)
 }
 
 fn doctor_candidate_artifact_class(relative_path: &str) -> DoctorAssetClass {
@@ -77181,6 +77203,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
 mod response_schema_tests {
     use super::*;
 
+    fn path_ends_with_portably(path: &str, suffix: &str) -> bool {
+        path.replace('\\', "/").ends_with(suffix)
+    }
+
     #[test]
     fn status_schema_includes_semantic_and_rebuild_truth() {
         let schemas = build_response_schemas();
@@ -77777,7 +77803,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "backup-filter-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77807,7 +77833,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data/raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "cass-data/raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77859,7 +77885,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data-link/raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "cass-data-link/raw-mirror/v1")
             }),
             "logical symlinked data-dir placement should still be checked against repo ignores: {risks:#?}"
         );
@@ -77921,7 +77947,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "sources-config-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "raw-mirror/v1")
             ),
             "sources config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );
