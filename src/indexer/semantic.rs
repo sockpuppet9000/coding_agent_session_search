@@ -196,11 +196,10 @@ pub struct SemanticBackfillBatchOutcome {
     pub manifest_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SemanticContentFingerprint {
-    total_conversations: usize,
-    max_conversation_id: i64,
-    max_message_id: i64,
+pub(crate) struct SemanticContentFingerprint {
+    pub(crate) total_conversations: usize,
+    pub(crate) max_conversation_id: i64,
+    pub(crate) max_message_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -500,7 +499,7 @@ fn semantic_generation_fingerprint_component(db_fingerprint: &str) -> String {
         .collect()
 }
 
-fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
+pub(crate) fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
     let mut parts = raw.strip_prefix("content-v1:")?.split(':');
     let total_conversations = parts.next()?.parse::<usize>().ok()?;
     let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
@@ -568,7 +567,7 @@ fn semantic_index_total_size_bytes(index_path: &Path) -> Result<u64> {
         Ok(meta) => {
             size = size.saturating_add(meta.len());
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind().eq(&std::io::ErrorKind::NotFound) => {}
         Err(err) => {
             return Err(err).with_context(|| format!("stat semantic WAL {}", wal_path.display()));
         }
@@ -591,10 +590,10 @@ fn semantic_artifact_matches_backfill_plan(
         && artifact.dimension == indexer.embedder_dimension()
 }
 
-fn semantic_artifact_is_append_only_prefix(
+pub(crate) fn semantic_artifact_is_append_only_prefix(
     storage: &FrankenStorage,
-    artifact_fingerprint: SemanticContentFingerprint,
-    current_fingerprint: SemanticContentFingerprint,
+    artifact_fingerprint: &SemanticContentFingerprint,
+    current_fingerprint: &SemanticContentFingerprint,
 ) -> Result<bool> {
     if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
         || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
@@ -603,13 +602,14 @@ fn semantic_artifact_is_append_only_prefix(
         return Ok(false);
     }
 
+    let prefix_param = ParamValue::from(artifact_fingerprint.max_conversation_id);
     let prefix_conversations: i64 = storage
         .raw()
         .query_row_map(
             "SELECT COUNT(*)
              FROM conversations
              WHERE id <= ?1",
-            &[ParamValue::from(artifact_fingerprint.max_conversation_id)],
+            std::slice::from_ref(&prefix_param),
             |row| row.get_typed(0),
         )
         .context("checking semantic backfill append-only prefix conversation count")?;
@@ -1382,10 +1382,17 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
     })
 }
 
-fn packet_embedding_inputs_from_storage_after_content_fingerprint(
+pub(crate) fn packet_embedding_inputs_from_storage_after_content_fingerprint(
     storage: &FrankenStorage,
-    artifact_fingerprint: SemanticContentFingerprint,
+    artifact_fingerprint: &SemanticContentFingerprint,
 ) -> Result<CanonicalIncrementalEmbeddingBatch> {
+    let params: Vec<ParamValue> =
+        std::iter::once(ParamValue::from(artifact_fingerprint.max_conversation_id))
+            .chain(std::iter::once(ParamValue::from(
+                artifact_fingerprint.max_message_id,
+            )))
+            .collect();
+
     let conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(
@@ -1408,16 +1415,13 @@ fn packet_embedding_inputs_from_storage_after_content_fingerprint(
                    LIMIT 1
                )
              ORDER BY c.id ASC",
-            &[
-                ParamValue::from(artifact_fingerprint.max_conversation_id),
-                ParamValue::from(artifact_fingerprint.max_message_id),
-            ],
+            params.as_slice(),
             |row| row.get_typed(0),
         )
         .with_context(|| {
             format!(
-                "fetching canonical semantic append-only conversation ids after fingerprint {:?}",
-                artifact_fingerprint
+                "fetching canonical semantic append-only conversation ids after conversation {} and message {}",
+                artifact_fingerprint.max_conversation_id, artifact_fingerprint.max_message_id
             )
         })?;
 
@@ -2547,15 +2551,15 @@ impl SemanticIndexer {
 
         if !semantic_artifact_is_append_only_prefix(
             storage,
-            artifact_fingerprint,
-            current_fingerprint,
+            &artifact_fingerprint,
+            &current_fingerprint,
         )? {
             return Ok(None);
         }
 
         let batch = packet_embedding_inputs_from_storage_after_content_fingerprint(
             storage,
-            artifact_fingerprint,
+            &artifact_fingerprint,
         )?;
         let expected_current_docs = artifact
             .doc_count
