@@ -13165,6 +13165,39 @@ fn semantic_artifact_index_path(data_dir: &Path, artifact: &ArtifactRecord) -> R
     Ok(resolved)
 }
 
+fn semantic_watch_once_wal_path_for_index(index_path: &Path) -> PathBuf {
+    let mut path = index_path.as_os_str().to_os_string();
+    path.push(".wal");
+    PathBuf::from(path)
+}
+
+fn semantic_watch_once_index_total_record_count(index: &FsVectorIndex) -> u64 {
+    u64::try_from(
+        index
+            .record_count()
+            .saturating_add(index.wal_record_count()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn semantic_watch_once_index_total_size_bytes(index_path: &Path) -> Result<u64> {
+    let mut size = fs::metadata(index_path)
+        .with_context(|| format!("stat semantic watch-once index {}", index_path.display()))?
+        .len();
+    let wal_path = semantic_watch_once_wal_path_for_index(index_path);
+    match fs::metadata(&wal_path) {
+        Ok(meta) => {
+            size = size.saturating_add(meta.len());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat semantic watch-once WAL {}", wal_path.display()));
+        }
+    }
+    Ok(size)
+}
+
 fn validate_semantic_watch_once_artifact(
     data_dir: &Path,
     artifact: &ArtifactRecord,
@@ -13200,7 +13233,7 @@ fn validate_semantic_watch_once_artifact(
             index_path.display()
         )
     })?;
-    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
+    let observed_docs = semantic_watch_once_index_total_record_count(&index);
     if !observed_docs.eq(&artifact.doc_count) {
         anyhow::bail!(
             "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
@@ -13380,14 +13413,7 @@ fn publish_semantic_watch_once_artifact(
     doc_count: u64,
     build_started_at_ms: i64,
 ) -> Result<()> {
-    let size_bytes = fs::metadata(&selection.index_path)
-        .with_context(|| {
-            format!(
-                "stat semantic watch-once index {}",
-                selection.index_path.display()
-            )
-        })?
-        .len();
+    let size_bytes = semantic_watch_once_index_total_size_bytes(&selection.index_path)?;
     let relative_index_path = selection
         .index_path
         .strip_prefix(data_dir)
@@ -13464,11 +13490,11 @@ fn run_targeted_semantic_watch_once_publish(
                     selection.index_path.display()
                 )
             })?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+            semantic_watch_once_index_total_record_count(&index)
         }
         TargetedSemanticWatchOnceMode::RebuildAll => {
             let index = indexer.build_and_save_index(embedded, data_dir)?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+            semantic_watch_once_index_total_record_count(&index)
         }
         TargetedSemanticWatchOnceMode::AppendToExisting => {
             if embedded_docs > 0 {
@@ -13485,7 +13511,7 @@ fn run_targeted_semantic_watch_once_publish(
                     selection.index_path.display()
                 )
             })?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+            semantic_watch_once_index_total_record_count(&index)
         }
     };
 
@@ -15250,6 +15276,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -15266,6 +15293,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -39187,7 +39215,7 @@ mod tests {
         );
         let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
         anyhow::ensure!(
-            matches!(index.record_count(), 2),
+            matches!(semantic_watch_once_index_total_record_count(&index), 2),
             "wrong vector record count"
         );
         Ok(())
@@ -39266,7 +39294,7 @@ mod tests {
         );
         let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
         anyhow::ensure!(
-            matches!(index.record_count(), 4),
+            matches!(semantic_watch_once_index_total_record_count(&index), 4),
             "wrong vector record count"
         );
         Ok(())
@@ -39340,7 +39368,7 @@ mod tests {
         );
         let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
         anyhow::ensure!(
-            matches!(index.record_count(), 2),
+            matches!(semantic_watch_once_index_total_record_count(&index), 2),
             "wrong vector record count"
         );
         Ok(())
