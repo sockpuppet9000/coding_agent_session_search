@@ -27963,12 +27963,7 @@ fn doctor_forensic_bundle_id(operation_id: &str, created_at_ms: i64) -> String {
 }
 
 fn doctor_forensic_relative_path_is_safe(relative_path: &Path) -> bool {
-    #[cfg(windows)]
-    let contains_forbidden_separator = false;
-    #[cfg(not(windows))]
-    let contains_forbidden_separator = relative_path.as_os_str().to_string_lossy().contains('\\');
-
-    !contains_forbidden_separator
+    !relative_path.as_os_str().to_string_lossy().contains('\\')
         && !relative_path.as_os_str().is_empty()
         && !relative_path.is_absolute()
         && relative_path.components().all(|component| match component {
@@ -28022,6 +28017,24 @@ fn doctor_portable_relative_component_is_safe(name: &std::ffi::OsStr) -> bool {
             | "LPT8"
             | "LPT9"
     )
+}
+
+fn doctor_forensic_prefixed_relative_path(prefix: &str, relative_to_root: &Path) -> PathBuf {
+    let mut portable = prefix.to_string();
+    for component in relative_to_root.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                portable.push('/');
+                portable.push_str(&name.to_string_lossy());
+            }
+            std::path::Component::CurDir => {}
+            other => {
+                portable.push('/');
+                portable.push_str(&other.as_os_str().to_string_lossy());
+            }
+        }
+    }
+    PathBuf::from(portable)
 }
 
 fn doctor_forensic_bundle_root_is_safe(data_dir: &Path, root: &Path) -> Result<(), String> {
@@ -28563,7 +28576,8 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
+            let relative =
+                doctor_forensic_prefixed_relative_path("raw-mirror-manifests", relative_to_root);
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -28596,7 +28610,8 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("index-manifests").join(relative_to_root);
+            let relative =
+                doctor_forensic_prefixed_relative_path("index-manifests", relative_to_root);
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
