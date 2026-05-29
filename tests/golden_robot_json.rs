@@ -37,6 +37,7 @@ use walkdir::WalkDir;
 /// deterministic test output (no update check, no ambient data-dir surprise).
 fn cass_cmd(test_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.current_dir(test_home);
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         // Pin data dir so the test never touches the user's real cache.
         .env("XDG_DATA_HOME", test_home)
