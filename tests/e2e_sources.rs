@@ -12,7 +12,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -319,7 +319,7 @@ fn sources_agents_include_removes_existing_exclusion() {
 }
 
 #[test]
-fn sources_agents_exclude_purges_local_archive_data_by_default() {
+fn sources_agents_exclude_purges_local_archive_data_by_default() -> anyhow::Result<()> {
     let tracker = tracker_for("sources_agents_exclude_purges_local_archive_data_by_default");
     let _trace_guard = tracker.trace_env_guard();
 
@@ -354,16 +354,14 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     let conversations = storage.list_conversations(10, 0).unwrap();
     assert_eq!(conversations.len(), 1);
     assert_eq!(conversations[0].agent_slug, "codex");
-    let fts_schema_rows: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            &[],
-            |row| row.get_typed(0),
-        )
-        .unwrap();
-    assert_eq!(
-        fts_schema_rows, 0,
+    let no_params: &[ParamValue] = &[]; // ubs:ignore
+    let fts_schema_rows: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        no_params,
+        |row| row.get_typed(0),
+    )?;
+    anyhow::ensure!(
+        fts_schema_rows == 0,
         "sources agents exclude must not materialize optional DB-resident FTS"
     );
 
@@ -435,6 +433,7 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
         "expected retained codex data to remain searchable: {}",
         String::from_utf8_lossy(&search_output.stdout)
     );
+    Ok(())
 }
 
 /// Test: sources list --verbose shows additional details.

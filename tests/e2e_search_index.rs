@@ -367,7 +367,7 @@ struct SearchLoopStats {
 
 #[test]
 #[serial]
-fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
+fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() -> anyhow::Result<()> {
     let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -497,25 +497,18 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         String::from_utf8_lossy(&incremental_index.stdout),
         String::from_utf8_lossy(&incremental_index.stderr)
     );
-    let post_index_probe =
-        RusqliteConnection::open(&db_path).expect("open db after no-repair index");
-    post_index_probe
-        .execute_batch("PRAGMA writable_schema = ON;")
-        .expect("enable writable_schema for malformed schema inspection");
-    let post_index_fts_rows: i64 = post_index_probe
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count fts schema rows after no-repair index");
-    assert_eq!(
-        post_index_fts_rows, 2,
+    let post_index_probe = RusqliteConnection::open(&db_path)?;
+    post_index_probe.execute_batch("PRAGMA writable_schema = ON;")?;
+    let post_index_fts_rows: i64 = post_index_probe.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        rusqlite::params_from_iter(std::iter::empty::<i64>()),
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        post_index_fts_rows == 2,
         "malformed derived FTS metadata should not be rewritten by ordinary indexing"
     );
-    post_index_probe
-        .execute_batch("PRAGMA writable_schema = OFF;")
-        .expect("disable writable_schema after malformed schema inspection");
+    post_index_probe.execute_batch("PRAGMA writable_schema = OFF;")?;
     drop(post_index_probe);
 
     let health = cargo_bin_cmd!("cass")
@@ -591,6 +584,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     );
 
     tracker.flush();
+    Ok(())
 }
 
 #[test]
