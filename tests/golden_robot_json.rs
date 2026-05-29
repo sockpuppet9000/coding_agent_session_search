@@ -565,6 +565,13 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
             "agent": "aider",
             "snippet": "private snippet",
             "content": "private prompt and assistant transcript"
+        }, {
+            "source_path": "/data/projects/coding_agent_session_search/tests/fixtures/search_demo_data/codex/demo.jsonl",
+            "workspace": "/data/projects/coding_agent_session_search",
+            "line_number": 7,
+            "agent": "codex",
+            "snippet": "historical private snippet",
+            "content": "historical private content"
         }]
     }))
     .expect("serialize fixture");
@@ -579,6 +586,13 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
     assert_eq!(scrubbed["results"][0]["workspace"], "[REPO]");
     assert_eq!(scrubbed["results"][0]["snippet"], "[RESULT_SNIPPET]");
     assert_eq!(scrubbed["results"][0]["content"], "[RESULT_CONTENT]");
+    assert_eq!(
+        scrubbed["results"][1]["source_path"],
+        "[REPO]/tests/fixtures/search_demo_data/codex/demo.jsonl"
+    );
+    assert_eq!(scrubbed["results"][1]["workspace"], "[REPO]");
+    assert_eq!(scrubbed["results"][1]["snippet"], "[RESULT_SNIPPET]");
+    assert_eq!(scrubbed["results"][1]["content"], "[RESULT_CONTENT]");
     assert!(
         !serde_json::to_string(&scrubbed)
             .expect("serialize scrubbed fixture")
@@ -628,6 +642,7 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     if !repo_root.is_empty() {
         out = out.replace(repo_root, "[REPO]");
     }
+    out = out.replace("/data/projects/coding_agent_session_search", "[REPO]");
 
     // 4. UUIDs.
     let uuid_re =
