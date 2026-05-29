@@ -72549,6 +72549,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "rebuilding": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
@@ -72684,6 +72685,9 @@ fn response_schema_rebuild_state() -> serde_json::Value {
         "type": "object",
         "properties": {
             "active": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
+            "last_progress_at": response_schema_nullable_type("string"),
+            "last_progress_age_ms": response_schema_nullable_type("integer"),
             "orphaned": { "type": "boolean" },
             "pid": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
@@ -72761,6 +72765,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
             "feature_compiled_in": { "type": "boolean" },
+            "quality_tier_published": { "type": "boolean" },
+            "semantic_only_search_available": { "type": "boolean" },
             "hint": { "type": ["string", "null"] },
             "fast_tier": {
                 "type": "object",
@@ -73046,6 +73052,13 @@ fn response_schema_object(
         .into_iter()
         .collect(),
     )
+}
+
+fn response_schema_nullable_type(kind: &str) -> serde_json::Value {
+    let mut types = Vec::with_capacity(2);
+    types.push(serde_json::Value::String(kind.to_owned()));
+    types.push(serde_json::Value::String("null".to_string()));
+    serde_json::json!({ "type": types })
 }
 
 fn response_schema_opaque_object() -> serde_json::Value {
