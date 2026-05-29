@@ -3482,8 +3482,9 @@ const MIGRATION_V14: &str = r"
 -- Drop the old V13 internal-content fts_messages first so that
 -- sqlite_schema does not contain two conflicting CREATE VIRTUAL TABLE
 -- entries, which makes the database completely unreadable.
--- The current contentless table is recreated lazily after open() only when the
--- frankensqlite FTS consistency check finds it missing or malformed.
+-- DB-resident fts_messages is derived and optional after V14; normal open/index
+-- leaves it absent and Tantivy remains authoritative unless an explicit repair
+-- path materializes it.
 DROP TABLE IF EXISTS fts_messages;
 ";
 

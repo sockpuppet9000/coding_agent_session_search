@@ -14233,12 +14233,14 @@ fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliErr
     }
 }
 
-fn validate_fts_messages_integrity_for_cli(
-    conn: &frankensqlite::Connection,
-    surface: &str,
-) -> CliResult<()> {
-    crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        .map_err(|err| fts_messages_integrity_cli_error(surface, err))
+fn warn_on_fts_messages_integrity_for_cli(conn: &frankensqlite::Connection, surface: &str) {
+    if let Err(err) = crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn) {
+        warn!(
+            surface,
+            error = %err,
+            "ignoring DB-resident FTS integrity failure because Tantivy is authoritative"
+        );
+    }
 }
 
 fn franken_query_row_map_retry<T, F>(
@@ -23445,7 +23447,7 @@ fn run_stats(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
-    validate_fts_messages_integrity_for_cli(&conn, "stats")?;
+    warn_on_fts_messages_integrity_for_cli(&conn, "stats");
     let conversation_columns = doctor_table_columns(&conn, "conversations");
     let source_id_sql = if conversation_columns.contains("source_id") {
         "c.source_id"
@@ -90123,13 +90125,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(purge);
     }
 
-    storage.rebuild_fts().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveFtsRebuild.kind_str(),
-        message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
-        hint: Some("Run 'cass index --full' to refresh derived search data".into()),
-        retryable: false,
-    })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
