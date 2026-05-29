@@ -7073,6 +7073,8 @@ impl FrankenStorage {
             |row| row.get_typed(0),
         )?;
 
+        self.purge_agent_archive_fts_rows_best_effort(agent_id);
+
         let mut tx = self.conn.transaction()?;
         tx.execute_compat(
             "DELETE FROM conversation_external_lookup
@@ -7106,6 +7108,70 @@ impl FrankenStorage {
             conversations_deleted: conversations_deleted.max(0) as usize,
             messages_deleted: messages_deleted.max(0) as usize,
         })
+    }
+
+    fn purge_agent_archive_fts_rows_best_effort(&self, agent_id: i64) {
+        let no_params = Vec::<ParamValue>::new();
+        let fts_schema_rows: i64 = match self.conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            &no_params,
+            |row| row.get_typed(0),
+        ) {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!(
+                    error = err.to_string(),
+                    "could not inspect optional DB-resident FTS before agent archive purge"
+                );
+                return;
+            }
+        };
+        if fts_schema_rows < 1 {
+            return;
+        }
+
+        let fts_columns: Vec<String> = match self.conn.query_map_collect(
+            "PRAGMA table_info(fts_messages)",
+            &no_params,
+            |row| row.get_typed(1),
+        ) {
+            Ok(columns) => columns,
+            Err(err) => {
+                tracing::warn!(
+                    error = err.to_string(),
+                    "could not inspect optional DB-resident FTS columns before agent archive purge"
+                );
+                return;
+            }
+        };
+        let delete_sql = if fts_columns.iter().any(|column| column == "message_id") {
+            "DELETE FROM fts_messages
+             WHERE CAST(message_id AS INTEGER) IN (
+                 SELECT m.id
+                 FROM messages m
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.agent_id = ?1
+             )"
+        } else {
+            "DELETE FROM fts_messages
+             WHERE rowid IN (
+                 SELECT m.id
+                 FROM messages m
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.agent_id = ?1
+             )"
+        };
+
+        let agent_param = ParamValue::from(agent_id);
+        if let Err(err) = self
+            .conn
+            .execute_compat(delete_sql, std::slice::from_ref(&agent_param))
+        {
+            tracing::warn!(
+                error = err.to_string(),
+                "could not purge optional DB-resident FTS rows for agent archive purge"
+            );
+        }
     }
 
     /// List all registered workspaces.
