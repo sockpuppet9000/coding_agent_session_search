@@ -19,8 +19,9 @@ use std::path::PathBuf;
 use coding_agent_search::indexer::semantic::{SemanticBackfillStoragePlan, SemanticIndexer};
 use coding_agent_search::indexer::semantic_progress::SemanticProgressSink;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::search::semantic_manifest::{SemanticManifest, TierKind};
+use coding_agent_search::search::semantic_manifest::{BuildCheckpoint, SemanticManifest, TierKind};
 use coding_agent_search::storage::sqlite::FrankenStorage;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -91,6 +92,29 @@ fn current_db_fingerprint(_db_path: &Path) -> TestResult<String> {
     // string. Use a marker string so a future audit can grep for "cass-257"
     // and find this test scaffold.
     Ok("cass-257-checkpoint-test-fp".to_string())
+}
+
+fn content_fingerprint(storage: &FrankenStorage) -> TestResult<String> {
+    let total_conversations: i64 =
+        storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })?;
+    let max_conversation_id: i64 = storage.raw().query_row_map(
+        "SELECT COALESCE(MAX(id), 0) FROM conversations",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    let max_message_id: i64 =
+        storage
+            .raw()
+            .query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", &[], |row| {
+                row.get_typed(0)
+            })?;
+    Ok(format!(
+        "content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}"
+    ))
 }
 
 #[test]
@@ -229,6 +253,365 @@ fn resume_skips_messages_with_id_at_or_below_last_message_id() -> TestResult {
     )?;
     assert!(third.published, "expected publication after third resume");
     assert_eq!(third.embedded_docs, 1);
+
+    Ok(())
+}
+
+#[test]
+fn resume_does_not_globally_filter_future_conversations_by_last_message_id() -> TestResult {
+    let workdir = TempDir::new()?;
+    let data_dir = workdir.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = workdir.path().join("agent_search.db");
+    let storage = seed_three_conversations(&db_path)?;
+    let db_fingerprint = current_db_fingerprint(&db_path)?;
+
+    // Recovered/imported archives are not guaranteed to have message PKs
+    // monotonic with conversation PKs. The resume cursor must therefore use
+    // `last_offset` for conversation paging and must not apply the previous
+    // batch's high message PK as a global filter to later conversations.
+    storage
+        .raw()
+        .execute("UPDATE messages SET id = 100 WHERE id = 1")?;
+
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut manifest = SemanticManifest::default();
+
+    let first = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: db_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 1,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(!first.published);
+    assert_eq!(first.embedded_docs, 1);
+    assert_eq!(
+        manifest.checkpoint.as_ref().and_then(|c| c.last_message_id),
+        Some(100),
+        "fixture should persist the intentionally high first message id"
+    );
+
+    let second = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: db_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 1,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(!second.published);
+    assert_eq!(
+        second.embedded_docs, 1,
+        "conversation 2 must still be selected even though its message id is below the prior high-water mark"
+    );
+    assert_eq!(second.last_offset, 2);
+
+    let third = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint,
+            model_revision: "hash".to_string(),
+            max_conversations: 1,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(
+        third.published,
+        "third conversation should complete the tier"
+    );
+    assert_eq!(third.embedded_docs, 1);
+
+    Ok(())
+}
+
+#[test]
+fn models_backfill_appends_ready_artifact_for_append_only_db_fingerprint() -> TestResult {
+    let workdir = TempDir::new()?;
+    let data_dir = workdir.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = workdir.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path)?;
+    let agent_id = storage.ensure_agent(&sample_agent())?;
+    for idx in 1..=20 {
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &sample_conversation(
+                &format!("seed-{idx:02}"),
+                &format!("append-only seed conversation {idx:02}"),
+            ),
+        )?;
+    }
+    let old_fingerprint = content_fingerprint(&storage)?;
+
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut manifest = SemanticManifest::default();
+    let initial = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: old_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(initial.published);
+    assert_eq!(initial.embedded_docs, 20);
+    assert_eq!(
+        manifest
+            .fast_tier
+            .as_ref()
+            .map(|artifact| artifact.doc_count),
+        Some(20)
+    );
+
+    storage.insert_conversation_tree(
+        agent_id,
+        None,
+        &sample_conversation("new", "new append-only conversation"),
+    )?;
+    storage
+        .raw()
+        .execute("UPDATE messages SET id = 0 WHERE conversation_id = 21")?;
+    let new_fingerprint = content_fingerprint(&storage)?;
+    assert_ne!(old_fingerprint, new_fingerprint);
+
+    let appended = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: new_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+
+    assert!(appended.published);
+    assert!(!appended.checkpoint_saved);
+    assert_eq!(
+        appended.embedded_docs, 1,
+        "append-only refresh should embed only the new conversation"
+    );
+    let artifact = manifest.fast_tier.as_ref().expect("fast tier artifact");
+    assert_eq!(artifact.db_fingerprint, new_fingerprint);
+    assert_eq!(
+        artifact.doc_count, 21,
+        "published doc_count must include un-compacted WAL entries"
+    );
+    assert_eq!(artifact.conversation_count, 21);
+    assert!(
+        manifest.checkpoint.is_none(),
+        "append-only publish should leave no resumable checkpoint"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn models_backfill_reuses_sibling_tier_append_without_reembedding() -> TestResult {
+    let workdir = TempDir::new()?;
+    let data_dir = workdir.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = workdir.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path)?;
+    let agent_id = storage.ensure_agent(&sample_agent())?;
+    for idx in 1..=20 {
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &sample_conversation(
+                &format!("shared-seed-{idx:02}"),
+                &format!("shared append seed conversation {idx:02}"),
+            ),
+        )?;
+    }
+    let old_fingerprint = content_fingerprint(&storage)?;
+
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut manifest = SemanticManifest::default();
+    let initial = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: old_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(initial.published);
+
+    let mut quality_artifact = manifest.fast_tier.as_ref().expect("fast artifact").clone();
+    quality_artifact.tier = TierKind::Quality;
+    manifest.quality_tier = Some(quality_artifact);
+
+    storage.insert_conversation_tree(
+        agent_id,
+        None,
+        &sample_conversation("shared-new", "shared append-only conversation"),
+    )?;
+    storage
+        .raw()
+        .execute("UPDATE messages SET id = 0 WHERE conversation_id = 21")?;
+    let new_fingerprint = content_fingerprint(&storage)?;
+
+    let quality = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Quality,
+            db_fingerprint: new_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(quality.published);
+    assert_eq!(quality.embedded_docs, 1);
+    assert_eq!(
+        manifest
+            .quality_tier
+            .as_ref()
+            .map(|artifact| artifact.doc_count),
+        Some(21)
+    );
+
+    let quality_again = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Quality,
+            db_fingerprint: new_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(quality_again.published);
+    assert_eq!(
+        quality_again.embedded_docs, 0,
+        "current artifact with un-compacted WAL should be a metadata refresh, not a rebuild"
+    );
+
+    manifest.checkpoint = Some(BuildCheckpoint {
+        tier: TierKind::Fast,
+        embedder_id: "fnv1a-384".to_string(),
+        last_offset: 21,
+        docs_embedded: 20,
+        conversations_processed: 20,
+        total_conversations: 21,
+        db_fingerprint: new_fingerprint.clone(),
+        schema_version: 1,
+        chunking_version: 1,
+        saved_at_ms: 1,
+        last_message_id: Some(20),
+    });
+
+    let fast = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: new_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(fast.published);
+    assert_eq!(
+        fast.embedded_docs, 0,
+        "sibling tier should reuse the already appended WAL entries"
+    );
+    assert!(manifest.checkpoint.is_none());
+    let fast_artifact = manifest.fast_tier.as_ref().expect("fast artifact");
+    let quality_artifact = manifest.quality_tier.as_ref().expect("quality artifact");
+    assert_eq!(fast_artifact.db_fingerprint, new_fingerprint);
+    assert_eq!(fast_artifact.doc_count, 21);
+    assert_eq!(quality_artifact.doc_count, 21);
+
+    storage.insert_conversation_tree(
+        agent_id,
+        None,
+        &sample_conversation("shared-new-2", "second shared append-only conversation"),
+    )?;
+    let second_fingerprint = content_fingerprint(&storage)?;
+
+    let second_quality = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Quality,
+            db_fingerprint: second_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(second_quality.published);
+    assert_eq!(second_quality.embedded_docs, 1);
+
+    manifest.checkpoint = Some(BuildCheckpoint {
+        tier: TierKind::Fast,
+        embedder_id: "fnv1a-384".to_string(),
+        last_offset: 22,
+        docs_embedded: 21,
+        conversations_processed: 21,
+        total_conversations: 22,
+        db_fingerprint: second_fingerprint.clone(),
+        schema_version: 1,
+        chunking_version: 1,
+        saved_at_ms: 2,
+        last_message_id: Some(21),
+    });
+
+    let second_fast = indexer.run_backfill_from_storage_with_sink(
+        &storage,
+        &data_dir,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: second_fingerprint.clone(),
+            model_revision: "hash".to_string(),
+            max_conversations: 64,
+        },
+        &SemanticProgressSink::disabled(),
+    )?;
+    assert!(second_fast.published);
+    assert_eq!(
+        second_fast.embedded_docs, 0,
+        "sibling tier should also reuse WAL when the old artifact doc_count already included an earlier WAL"
+    );
+    let fast_artifact = manifest.fast_tier.as_ref().expect("fast artifact");
+    let quality_artifact = manifest.quality_tier.as_ref().expect("quality artifact");
+    assert_eq!(fast_artifact.db_fingerprint, second_fingerprint);
+    assert_eq!(fast_artifact.doc_count, 22);
+    assert_eq!(quality_artifact.doc_count, 22);
 
     Ok(())
 }
