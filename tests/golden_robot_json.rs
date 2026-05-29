@@ -790,6 +790,47 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     out
 }
 
+fn golden_diff_preview(expected: &str, actual: &str) -> String {
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let max_len = expected_lines.len().max(actual_lines.len());
+    let first_diff = (0..max_len).find(|&idx| {
+        expected_lines.get(idx).copied().unwrap_or("")
+            != actual_lines.get(idx).copied().unwrap_or("")
+    });
+
+    let Some(first_diff) = first_diff else {
+        return format!(
+            "line content matches; trailing newline differs: expected={}, actual={}",
+            expected.ends_with('\n'),
+            actual.ends_with('\n')
+        );
+    };
+
+    let start = first_diff.saturating_sub(4);
+    let end = (first_diff + 5).min(max_len);
+    let mut preview = format!("first differing line: {}\n", first_diff + 1);
+    for idx in start..end {
+        match (expected_lines.get(idx), actual_lines.get(idx)) {
+            (Some(expected), Some(actual)) if expected == actual => {
+                preview.push_str(&format!(" {:>5}  {}\n", idx + 1, expected));
+            }
+            (Some(expected), Some(actual)) => {
+                preview.push_str(&format!("-{:>5}  {}\n", idx + 1, expected));
+                preview.push_str(&format!("+{:>5}  {}\n", idx + 1, actual));
+            }
+            (Some(expected), None) => {
+                preview.push_str(&format!("-{:>5}  {}\n", idx + 1, expected));
+            }
+            (None, Some(actual)) => {
+                preview.push_str(&format!("+{:>5}  {}\n", idx + 1, actual));
+            }
+            (None, None) => {}
+        }
+    }
+    preview
+}
+
 /// Compare `actual` against the golden at `tests/golden/<name>`. Writes /
 /// overwrites the golden when `UPDATE_GOLDENS=1` is set in the env.
 fn assert_golden(name: &str, actual: &str) {
@@ -820,16 +861,19 @@ fn assert_golden(name: &str, actual: &str) {
         // Dump actual next to golden for easy diffing.
         let actual_path = golden_path.with_extension("actual");
         std::fs::write(&actual_path, actual).expect("write .actual file");
+        let diff_preview = golden_diff_preview(&expected, actual);
         panic!(
             "GOLDEN MISMATCH: {name}\n\n\
              Expected: {}\n\
              Actual:   {}\n\n\
+             Diff preview:\n{}\n\
              diff the two files to see the drift, then either:\n\
              \t- fix the code if this was unintentional, or\n\
              \t- regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json \\\n\
              \t              && git diff tests/golden/ && git add tests/golden/",
             golden_path.display(),
             actual_path.display(),
+            diff_preview,
         );
     }
 }
