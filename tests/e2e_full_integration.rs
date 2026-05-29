@@ -9,7 +9,7 @@
 //! Bead: coding_agent_session_search-1p9xd
 
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -363,7 +363,7 @@ fn e2e_robot_mode_json_structure() {
 
 /// Verify that the database maintains referential integrity after indexing.
 #[test]
-fn e2e_database_integrity() {
+fn e2e_database_integrity() -> anyhow::Result<()> {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -438,22 +438,20 @@ fn e2e_database_integrity() {
         .expect("orphan conv check");
     assert_eq!(orphan_convs, 0, "No orphan conversations should exist");
 
-    let integrity_check: String = conn
-        .query_row_map("PRAGMA integrity_check", &[], |r| r.get_typed(0))
-        .expect("integrity check after full index");
-    assert_eq!(
-        integrity_check, "ok",
+    let no_params: &[ParamValue] = &[]; // ubs:ignore
+    let integrity_check: String =
+        conn.query_row_map("PRAGMA integrity_check", no_params, |r| r.get_typed(0))?;
+    anyhow::ensure!(
+        integrity_check == "ok",
         "full indexing should leave the canonical archive structurally clean"
     );
-    let fts_schema_rows: i64 = conn
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .expect("count fts schema rows");
-    assert_eq!(
-        fts_schema_rows, 0,
+    let fts_schema_rows: i64 = conn.query_row_map(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        no_params,
+        |r| r.get_typed(0),
+    )?;
+    anyhow::ensure!(
+        fts_schema_rows == 0,
         "full indexing should not materialize derived DB-resident FTS by default"
     );
     let msg_count = count_messages(&db_path);
@@ -486,6 +484,7 @@ fn e2e_database_integrity() {
         Some(true),
         "Doctor should report a healthy DB after full index: {doctor_json}"
     );
+    Ok(())
 }
 
 // ============================================================================

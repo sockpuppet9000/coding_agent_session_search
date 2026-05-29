@@ -9947,9 +9947,10 @@ impl FrankenStorage {
     }
 
     fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
+        let no_params: &[ParamValue] = &[]; // ubs:ignore
         let existing_fts_schema_rows: i64 = self.conn.query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            fparams![],
+            no_params,
             |row| row.get_typed(0),
         )?;
         if existing_fts_schema_rows == 0 {

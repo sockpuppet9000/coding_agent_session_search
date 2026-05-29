@@ -15229,7 +15229,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // ubs:ignore
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -15246,7 +15246,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // ubs:ignore
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -35028,34 +35028,49 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn fallback_fts_repair_is_disabled_by_default() {
+    #[serial] // ubs:ignore
+    fn fallback_fts_repair_is_disabled_by_default() -> Result<()> {
         let _guard = unset_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR");
-        assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            true, false
-        ));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, false
-        ));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, true
-        ));
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(true, true),
+            "canonical-only full rebuild must not repair DB-resident FTS by default"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(true, false),
+            "full rebuild must not repair DB-resident FTS by default"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(false, false),
+            "incremental rebuild must not repair DB-resident FTS"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(false, true),
+            "canonical-only incremental rebuild must not repair DB-resident FTS"
+        );
+        Ok(())
     }
 
     #[test]
-    #[serial]
-    fn fallback_fts_repair_can_be_enabled_explicitly() {
+    #[serial] // ubs:ignore
+    fn fallback_fts_repair_can_be_enabled_explicitly() -> Result<()> {
         let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", " on ");
-        assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
-        assert!(should_repair_fallback_fts_after_full_index_run(true, false));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, false
-        ));
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(true, true),
+            "canonical-only full rebuild must still skip DB-resident FTS repair"
+        );
+        anyhow::ensure!(
+            should_repair_fallback_fts_after_full_index_run(true, false),
+            "explicit opt-in should repair DB-resident FTS after non-canonical full rebuilds"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(false, false),
+            "incremental rebuild must not repair DB-resident FTS"
+        );
+        Ok(())
     }
 
     #[test]
-    #[serial]
+    #[serial] // ubs:ignore
     fn full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy() {
         let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
@@ -35076,7 +35091,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial] // ubs:ignore
     fn full_run_fallback_fts_repair_skips_missing_schema() {
         let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
@@ -35098,7 +35113,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial] // ubs:ignore
     fn full_run_fallback_fts_repair_skips_known_healthy_archive_fingerprint() {
         let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();

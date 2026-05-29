@@ -7016,14 +7016,23 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
         let sqlite_guard = self.sqlite_guard()?;
         let Some(conn) = sqlite_guard.as_ref() else {
             return Ok(Vec::new());
+        };
+
+        let query_match_type = dominant_match_type(raw_query);
+        let scan_request = SqliteMessageScanRequest {
+            raw_query,
+            filters: &filters,
+            limit,
+            offset,
+            field_mask,
+            query_match_type,
+        };
+        let fts_query = match transpile_to_fts5(raw_query) {
+            Some(q) if !q.trim().is_empty() => q,
+            _ => return self.search_sqlite_message_scan(conn, scan_request),
         };
 
         let empty_params: [ParamValue; 0] = [];
@@ -7036,18 +7045,8 @@ impl SearchClient {
         .map(|rows| !rows.is_empty())
         .unwrap_or(false);
         if !has_fts {
-            return Ok(Vec::new());
+            return self.search_sqlite_message_scan(conn, scan_request);
         }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let scan_request = SqliteMessageScanRequest {
-            raw_query,
-            filters: &filters,
-            limit,
-            offset,
-            field_mask,
-            query_match_type,
-        };
         if let Err(err) =
             crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
         {
@@ -11431,32 +11430,11 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
-            let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
-            let sql = format!(
-                "SELECT COUNT(*) FROM fts_messages WHERE {}",
-                SearchClient::sqlite_fts5_match_clause(match_mode)
-            );
-            let mut params = Vec::new();
-            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-            match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
-                Ok(rows) => {
-                    let count: i64 = rows.into_iter().next().unwrap_or(0);
-                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
-                }
-                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
-                Err(err) => Err(err.into()),
-            }
-        }
-
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
 
         {
             let storage = FrankenStorage::open(&db_path)?;
-            // V14 drops fts_messages during migration — run the lazy repair
-            // so the direct INSERT INTO fts_messages below can land.
-            storage.ensure_search_fallback_fts_consistency()?;
             let conn = storage.raw();
             conn.execute(
                 "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
@@ -11480,53 +11458,21 @@ mod tests {
                 "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
                  VALUES(12, 2, 0, 'user', 'Need follow-up on br-123 user report', 101)",
             )?;
-            conn.execute_compat(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    ParamValue::from(11_i64),
-                    ParamValue::from("Need follow-up on br-123 root cause"),
-                    ParamValue::from("alpha bead"),
-                    ParamValue::from("codex"),
-                    ParamValue::from("/ws/alpha"),
-                    ParamValue::from("/tmp/alpha.jsonl"),
-                    ParamValue::from(100_i64),
-                ],
+            let fts_schema_rows: i64 = conn.query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                params![],
+                |row| row.get_typed(0),
             )?;
-            conn.execute_compat(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    ParamValue::from(12_i64),
-                    ParamValue::from("Need follow-up on br-123 user report"),
-                    ParamValue::from("beta bead"),
-                    ParamValue::from("codex"),
-                    ParamValue::from("/ws/beta"),
-                    ParamValue::from("/tmp/beta.jsonl"),
-                    ParamValue::from(101_i64),
-                ],
-            )?;
-            let preclose_total_rows: i64 =
-                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
-                    row.get_typed(0)
-                })?;
             assert_eq!(
-                preclose_total_rows, 2,
-                "freshly seeded file-backed FTS should retain the inserted rows"
+                fts_schema_rows, 0,
+                "file-backed sqlite fallback fixture should start as a no-FTS DB"
             );
-            let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
-                assert_eq!(
-                    match_count, 2,
-                    "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
-                );
-            }
         }
 
         let client = SearchClient {
             reader: None,
             sqlite: Mutex::new(None),
-            sqlite_path: Some(db_path),
+            sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -11542,21 +11488,15 @@ mod tests {
 
         let guard = client.sqlite_guard()?;
         let conn = guard.as_ref().expect("sqlite guard should reopen file db");
-        let reopened_total_rows: i64 =
-            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
-                row.get_typed(0)
-            })?;
+        let reopened_fts_schema_rows: i64 = conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            params![],
+            |row| row.get_typed(0),
+        )?;
         assert_eq!(
-            reopened_total_rows, 2,
-            "reopened file-backed FTS should still contain the seeded rows"
+            reopened_fts_schema_rows, 0,
+            "sqlite guard should not materialize optional DB-resident FTS"
         );
-        let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
-            assert_eq!(
-                match_count, 2,
-                "reopened file-backed FTS should still match the transpiled hyphenated query"
-            );
-        }
         drop(guard);
 
         let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
