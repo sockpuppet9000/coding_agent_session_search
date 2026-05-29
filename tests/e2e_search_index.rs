@@ -497,6 +497,26 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         String::from_utf8_lossy(&incremental_index.stdout),
         String::from_utf8_lossy(&incremental_index.stderr)
     );
+    let post_index_probe =
+        RusqliteConnection::open(&db_path).expect("open db after no-repair index");
+    post_index_probe
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .expect("enable writable_schema for malformed schema inspection");
+    let post_index_fts_rows: i64 = post_index_probe
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count fts schema rows after no-repair index");
+    assert_eq!(
+        post_index_fts_rows, 2,
+        "malformed derived FTS metadata should not be rewritten by ordinary indexing"
+    );
+    post_index_probe
+        .execute_batch("PRAGMA writable_schema = OFF;")
+        .expect("disable writable_schema after malformed schema inspection");
+    drop(post_index_probe);
 
     let health = cargo_bin_cmd!("cass")
         .args(["health", "--json", "--data-dir"])
@@ -508,7 +528,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         .expect("run health after duplicate schema repair");
     assert!(
         health.status.success(),
-        "health should report the repaired database as healthy\nstdout:\n{}\nstderr:\n{}",
+        "health should tolerate malformed derived FTS metadata when Tantivy remains authoritative\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&health.stdout),
         String::from_utf8_lossy(&health.stderr)
     );

@@ -1726,6 +1726,9 @@ pub(crate) struct SqliteDatabaseHealthProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FtsConsistencyRepair {
+    Skipped {
+        reason: FtsConsistencySkipReason,
+    },
     AlreadyHealthy {
         rows: usize,
     },
@@ -1736,6 +1739,11 @@ pub(crate) enum FtsConsistencyRepair {
     Rebuilt {
         inserted_rows: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsConsistencySkipReason {
+    Absent,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -9829,6 +9837,10 @@ impl FrankenStorage {
         validate_fts_messages_integrity_for_connection(&self.conn)
     }
 
+    pub(crate) fn disable_db_resident_fts_maintenance_for_process(&self) {
+        self.set_fts_messages_present_cache(false);
+    }
+
     pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
         &self,
         archive_fingerprint: &str,
@@ -9951,6 +9963,18 @@ impl FrankenStorage {
     }
 
     fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
+        let existing_fts_schema_rows: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        if existing_fts_schema_rows == 0 {
+            self.set_fts_messages_present_cache(false);
+            return Ok(FtsConsistencyRepair::Skipped {
+                reason: FtsConsistencySkipReason::Absent,
+            });
+        }
+
         if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
             // Before triggering an expensive full rebuild, probe whether
             // fts_messages is already populated and consistent.  On large
@@ -17347,13 +17371,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
-        // V14 drops fts_messages during migration; cass normally recreates it
-        // during startup via `ensure_search_fallback_fts_consistency`. Tests
-        // that inspect fts_messages directly need to run the same repair pass
-        // to exercise the "insert flushes FTS" contract.
+        // Production startup no longer materializes DB-resident FTS by default;
+        // this test opts in explicitly to exercise the legacy insert-flush path.
         storage
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency before insert");
+            .rebuild_fts()
+            .expect("materialize FTS before insert");
 
         let agent = Agent {
             id: None,
@@ -21238,8 +21260,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            reopened_fts_entries, 1,
-            "seeded canonical db should keep a single stock-SQLite fts_messages schema row"
+            reopened_fts_entries, 0,
+            "seeded canonical db should leave derived fts_messages absent by default"
         );
         let reopened_message_count: i64 = reopened_readonly
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
@@ -21253,15 +21275,15 @@ mod tests {
             franken_seeded.schema_version().unwrap(),
             CURRENT_SCHEMA_VERSION
         );
-        // Post-V14 fts_messages is recreated lazily. `FrankenStorage::open`
-        // alone doesn't re-register the virtual table for the frankensqlite
-        // query engine — the consistency pass does, and this is exactly what
-        // normal cass startup runs before the first search. Invoke it
-        // explicitly so the query below exercises the expected post-repair
-        // state rather than the between-steps state.
-        franken_seeded
+        let fts_repair = franken_seeded
             .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency after seed");
+            .expect("check FTS consistency after seed");
+        assert_eq!(
+            fts_repair,
+            FtsConsistencyRepair::Skipped {
+                reason: FtsConsistencySkipReason::Absent
+            }
+        );
         let post_franken_schema_rows: i64 = franken_seeded
             .raw()
             .query_row_map(
@@ -21270,13 +21292,13 @@ mod tests {
                 |row| row.get_typed(0),
             )
             .unwrap();
-        assert_eq!(post_franken_schema_rows, 1);
+        assert_eq!(post_franken_schema_rows, 0);
         let fts_probe = franken_seeded
             .raw()
             .query("SELECT COUNT(*) FROM fts_messages");
         assert!(
-            fts_probe.is_ok(),
-            "expected post-seed FTS to be queryable, got {fts_probe:?}"
+            fts_probe.is_err(),
+            "post-seed FTS should remain absent unless explicitly rebuilt"
         );
     }
 
@@ -25069,30 +25091,30 @@ mod tests {
     }
 
     #[test]
-    fn franken_storage_open_fresh_db_keeps_single_franken_fts_schema_row() {
+    fn franken_storage_open_fresh_db_keeps_db_resident_fts_absent() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fresh-franken-storage-open.db");
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
-        // The FTS5 virtual table is no longer created eagerly by the
-        // migration runner (V14 drops the old internal-content table and the
-        // current contentless table is recreated lazily — see MIGRATION_V14).
-        // Invoke the repair path to match normal cass startup, then assert
-        // there is exactly one fts_messages entry in sqlite_schema (no
-        // duplicates).
-        storage
+        let repair = storage
             .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency after fresh open");
+            .expect("check FTS consistency after fresh open");
+        assert_eq!(
+            repair,
+            FtsConsistencyRepair::Skipped {
+                reason: FtsConsistencySkipReason::Absent
+            }
+        );
         drop(storage);
 
         let c_reader = FrankenConnection::open(db_path.to_string_lossy().into_owned())
             .expect("open DB via frankensqlite for sqlite_master inspection");
         assert_eq!(
             franken_fts_schema_rows(&c_reader).unwrap(),
-            1,
-            "exactly one fts_messages schema row should exist after ensure_search_fallback_fts_consistency"
+            0,
+            "fresh open should keep derived fts_messages absent"
         );
         drop(c_reader);
 
@@ -25101,8 +25123,8 @@ mod tests {
             storage
                 .raw()
                 .query("SELECT COUNT(*) FROM fts_messages")
-                .is_ok(),
-            "fts_messages must be queryable through frankensqlite after open"
+                .is_err(),
+            "fts_messages should remain absent unless explicitly rebuilt"
         );
     }
 

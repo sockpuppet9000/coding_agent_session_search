@@ -438,22 +438,28 @@ fn e2e_database_integrity() {
         .expect("orphan conv check");
     assert_eq!(orphan_convs, 0, "No orphan conversations should exist");
 
-    // The current contentless FTS table is considered healthy if frankensqlite can
-    // query it and at least one row is visible through the canonical doctor probe.
-    let fts_probe_rows: Vec<i64> = conn
-        .query_map_collect("SELECT rowid FROM fts_messages LIMIT 1", &[], |r| {
-            r.get_typed(0)
-        })
-        .expect("fts probe");
-    let msg_count = count_messages(&db_path);
-    assert!(
-        !fts_probe_rows.is_empty(),
-        "FTS should expose at least one indexed row after indexing"
+    let integrity_check: String = conn
+        .query_row_map("PRAGMA integrity_check", &[], |r| r.get_typed(0))
+        .expect("integrity check after full index");
+    assert_eq!(
+        integrity_check, "ok",
+        "full indexing should leave the canonical archive structurally clean"
     );
+    let fts_schema_rows: i64 = conn
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            &[],
+            |r| r.get_typed(0),
+        )
+        .expect("count fts schema rows");
+    assert_eq!(
+        fts_schema_rows, 0,
+        "full indexing should not materialize derived DB-resident FTS by default"
+    );
+    let msg_count = count_messages(&db_path);
     verbose!(
-        "DB integrity OK: {} messages, FTS queryable with {} visible probe rows, 0 orphans",
-        msg_count,
-        fts_probe_rows.len()
+        "DB integrity OK: {} messages, DB-resident FTS absent by default, 0 orphans",
+        msg_count
     );
 
     let doctor_output = Command::new(cass_bin())

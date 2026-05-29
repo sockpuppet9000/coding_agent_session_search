@@ -15098,12 +15098,10 @@ fn probe_state_db(
     snapshot.opened = true;
     if let Err(err) = crate::storage::sqlite::validate_fts_messages_integrity_for_connection(&conn)
     {
-        snapshot.opened = false;
-        snapshot.open_error = Some(err.to_string());
-        snapshot.open_retryable = false;
-        snapshot.counts_skipped = true;
-        let _ = close_franken_cli_read_db(conn, db_path, reason);
-        return snapshot;
+        tracing::warn!(
+            error = %err,
+            "ignoring DB-resident FTS integrity failure for health snapshot because Tantivy is authoritative"
+        );
     }
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
