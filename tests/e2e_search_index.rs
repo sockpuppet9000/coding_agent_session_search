@@ -8,6 +8,7 @@
 //!
 //! Part of bead: coding_agent_session_search-0jt (TST.11)
 
+use anyhow::Context;
 use assert_cmd::cargo::cargo_bin_cmd;
 use chrono::{SecondsFormat, Utc};
 use coding_agent_search::search::tantivy::{
@@ -532,6 +533,25 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() -> anyhow::Resu
         serde_json::Value::Bool(true),
         "health should treat the canonical archive plus Tantivy index as healthy"
     );
+
+    let stats = cargo_bin_cmd!("cass")
+        .arg("stats")
+        .arg("--json")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .context("run stats after duplicate schema injection")?;
+    anyhow::ensure!(
+        stats.status.success(),
+        "stats should tolerate malformed derived FTS metadata when canonical SQLite opens\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stats.stdout),
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let _: serde_json::Value =
+        serde_json::from_slice(&stats.stdout).context("parse stats json after duplicate FTS")?;
 
     std::thread::sleep(std::time::Duration::from_millis(1200));
     append_codex_session(&session_file, "fts_repair_appended_token", ts + 10_000);

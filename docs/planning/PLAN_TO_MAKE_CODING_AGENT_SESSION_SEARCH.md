@@ -492,9 +492,14 @@ CREATE INDEX idx_messages_created
     ON messages(created_at);
 ```
 
-### 4.4 SQLite FTS5 Mirror
+### 4.4 SQLite FTS5 Derived Cache
 
-To support fallback search (and some advanced filters), create an FTS5 virtual table:
+SQLite `conversations` and `messages` are the canonical local archive. Tantivy is the
+authoritative lexical/search backend when available. The DB-resident FTS5 table is
+a CASS-owned, optional derived cache for degraded DB-only fallback paths; normal
+open/index/read/health/stat paths must not create it just because it is absent.
+
+Older databases may still contain an `fts_messages` virtual table:
 
 ```sql
 CREATE VIRTUAL TABLE fts_messages
@@ -510,9 +515,14 @@ USING fts5(
 );
 ```
 
-We then keep `fts_messages` synchronized with `messages` via our Rust code (not triggers, to avoid performance surprises).
+If present and healthy, it can accelerate SQLite-only fallback search. It must
+remain derived: search must not emit FTS rows whose canonical `messages` metadata
+is gone, and purge paths should best-effort remove matching FTS rows without
+letting a malformed FTS cache block canonical archive mutations.
 
-FTS5 gives fast text search, built-in ranking, and helps on platforms where Tantivy or its index is temporarily unavailable.([SQLite][21])
+Repair/materialization is explicit. `CASS_DB_RESIDENT_FTS_AUTO_REPAIR=1` may repair
+an existing malformed/stale `fts_messages` cache during full-index maintenance,
+but a missing `fts_messages` table remains absent / `Skipped(Absent)`.
 
 ---
 

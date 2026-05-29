@@ -2830,6 +2830,11 @@
       "description": "Suppress NDJSON progress events from cass index --json when set to 1."
     },
     {
+      "name": "CASS_DB_RESIDENT_FTS_AUTO_REPAIR",
+      "default": "0",
+      "description": "Opt in to repairing an existing DB-resident fts_messages cache during full-index maintenance; missing fts_messages stays absent."
+    },
+    {
       "name": "CASS_SEMANTIC_EMBEDDER",
       "description": "Select the semantic embedder/model implementation when configured."
     },

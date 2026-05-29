@@ -14088,15 +14088,56 @@ fn open_franken_cli_read_db(
                     if let Some(fts_err) =
                         crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
                     {
-                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
+                        match crate::storage::sqlite::open_franken_raw_connection_with_timeout(
+                            &path,
+                            busy_timeout,
+                        ) {
+                            Ok(conn) => {
+                                warn!(
+                                    error = %fts_err,
+                                    db_path = %path.display(),
+                                    reason,
+                                    "readonly open was blocked by optional DB-resident FTS metadata; continuing with a query-only raw connection"
+                                );
+                                conn
+                            }
+                            Err(raw_write_err) => {
+                                match crate::storage::sqlite::FrankenStorage::open(&path) {
+                                    Ok(storage) => {
+                                        warn!(
+                                            error = %fts_err,
+                                            raw_write_error = %raw_write_err,
+                                            db_path = %path.display(),
+                                            reason,
+                                            "raw read fallback was blocked by optional DB-resident FTS metadata; continuing with a storage-open raw connection"
+                                        );
+                                        storage.into_raw()
+                                    }
+                                    Err(storage_write_err) => {
+                                        tracing::debug!(
+                                            raw_write_error = %raw_write_err,
+                                            storage_write_error = %storage_write_err,
+                                            db_path = %path.display(),
+                                            reason,
+                                            "query-only fallback after optional FTS open failure also failed"
+                                        );
+                                        return Err(fts_messages_integrity_cli_error(
+                                            reason,
+                                            fts_err.into(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(CliError {
+                            code: 9,
+                            kind: CliErrorKind::DbOpen.kind_str(),
+                            message,
+                            hint: None,
+                            retryable: readonly_retryable || raw_readonly_retryable,
+                        });
                     }
-                    return Err(CliError {
-                        code: 9,
-                        kind: CliErrorKind::DbOpen.kind_str(),
-                        message,
-                        hint: None,
-                        retryable: readonly_retryable || raw_readonly_retryable,
-                    });
                 }
             }
         }
@@ -17708,6 +17749,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPECT_NO_COLOR=1                  honor global NO_COLOR".to_string(),
             "  CASS_TRACE_FILE                          default trace path".to_string(),
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
+            "  CASS_DB_RESIDENT_FTS_AUTO_REPAIR=1       opt in to repairing an existing DB-resident fts_messages cache during full-index maintenance; missing fts_messages stays absent".to_string(),
             "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
             "  CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE=<F>  loadavg/core threshold for step-down (default 1.25)".to_string(),
@@ -71378,6 +71420,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_INDEX_NO_PROGRESS_EVENTS",
             Some("0"),
             "Suppress NDJSON progress events from cass index --json when set to 1.",
+        ),
+        env_var_capability(
+            "CASS_DB_RESIDENT_FTS_AUTO_REPAIR",
+            Some("0"),
+            "Opt in to repairing an existing DB-resident fts_messages cache during full-index maintenance; missing fts_messages stays absent.",
         ),
         env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
