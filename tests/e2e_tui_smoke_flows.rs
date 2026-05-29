@@ -2449,12 +2449,11 @@ fn tui_typing_writes_latency_trace() {
         wait_for_output_growth(&captured, before_query_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after live query typing in latency PTY"
     );
-    let before_submit_len = captured.lock().expect("capture lock").len();
-    send_key_sequence(&mut *writer, b"\r");
-    thread::sleep(Duration::from_millis(120));
     assert!(
-        wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
-        "Did not observe output growth after explicit query submission in latency PTY"
+        wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+            rendered.contains("hello") && rendered_contains_hello_fixture_content(rendered)
+        }),
+        "Did not observe rendered hello search results before latency trace validation"
     );
     thread::sleep(Duration::from_millis(250));
 
