@@ -7909,8 +7909,8 @@ fn should_repair_fallback_fts_after_full_index_run(
 
 fn fallback_fts_auto_repair_enabled() -> bool {
     dotenvy::var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34189,7 +34189,7 @@ mod tests {
 
     #[test]
     fn disk_headroom_skip_env_value_parser_is_truthy_not_presence_based() {
-        for truthy in ["1", "true", "YES", "on"] {
+        for truthy in ["1", "true", "YES", "on", " True "] {
             assert!(
                 env_value_truthy(truthy),
                 "expected {truthy:?} to disable the headroom check"
@@ -35046,7 +35046,7 @@ mod tests {
     #[test]
     #[serial]
     fn fallback_fts_repair_can_be_enabled_explicitly() {
-        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", " on ");
         assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
         assert!(should_repair_fallback_fts_after_full_index_run(true, false));
         assert!(!should_repair_fallback_fts_after_full_index_run(
