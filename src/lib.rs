@@ -27895,6 +27895,25 @@ fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
         .unwrap_or_else(|| "[external]".to_string())
 }
 
+fn doctor_portable_relative_path(relative_path: &Path) -> Option<String> {
+    if relative_path.as_os_str().is_empty() || relative_path.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            std::path::Component::Normal(name)
+                if doctor_portable_relative_component_is_safe(name) =>
+            {
+                parts.push(name.to_string_lossy().into_owned());
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 fn doctor_redacted_text(text: &str, data_dir: &Path) -> String {
     let data_dir_text = data_dir.display().to_string();
     text.replace(&data_dir_text, "[cass-data]")
@@ -28601,7 +28620,10 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
+            let Some(relative_to_root) = doctor_portable_relative_path(relative_to_root) else {
+                continue;
+            };
+            let relative = PathBuf::from(format!("raw-mirror-manifests/{relative_to_root}"));
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -28634,7 +28656,10 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("index-manifests").join(relative_to_root);
+            let Some(relative_to_root) = doctor_portable_relative_path(relative_to_root) else {
+                continue;
+            };
+            let relative = PathBuf::from(format!("index-manifests/{relative_to_root}"));
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
@@ -36859,7 +36884,7 @@ fn doctor_candidate_live_inventory(
 fn doctor_candidate_relative_path(candidate_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(candidate_dir)
         .ok()
-        .map(|relative| relative.display().to_string())
+        .and_then(doctor_portable_relative_path)
 }
 
 fn doctor_candidate_artifact_class(relative_path: &str) -> DoctorAssetClass {
@@ -77692,6 +77717,10 @@ mod response_schema_tests {
         std::fs::write(path, vec![b'x'; bytes]).expect("write storage fixture file");
     }
 
+    fn path_text_ends_with_portable(path: &str, suffix: &str) -> bool {
+        path.replace('\\', "/").ends_with(suffix)
+    }
+
     #[test]
     fn doctor_storage_pressure_classifies_precious_and_reclaimable_bytes() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -77817,7 +77846,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "backup-filter-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_text_ends_with_portable(&risk.path, "raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77847,7 +77876,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data/raw-mirror/v1")
+                    && path_text_ends_with_portable(&risk.path, "cass-data/raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77954,14 +77983,14 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "cass-config-excludes-cass-evidence"
-                    && risk.path.ends_with("backups")
+                    && path_text_ends_with_portable(&risk.path, "backups")
             ),
             "cass config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "sources-config-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_text_ends_with_portable(&risk.path, "raw-mirror/v1")
             ),
             "sources config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );
