@@ -24790,26 +24790,30 @@ fn doctor_check_report(
     }
 }
 
-fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str {
+fn doctor_safe_auto_named_action_for_check(check: &DoctorCheckReport) -> Option<&'static str> {
     match check.name.as_str() {
-        "data_directory" => "create_missing_cass_data_dir",
-        "lock_file" => "remove_stale_legacy_index_lock",
+        "data_directory" => Some("create_missing_cass_data_dir"),
+        "lock_file" => Some("remove_stale_legacy_index_lock"),
         "index" | "index_sync" | "fts_table" | "rebuild" => {
-            "rebuild_derived_lexical_index_from_archive_db"
+            Some("rebuild_derived_lexical_index_from_archive_db")
         }
-        "semantic_model" => "report_lexical_fallback_without_model_download",
-        "raw_mirror_backfill" => "backfill_additive_raw_mirror_metadata",
-        "candidate_staging" => "build_isolated_reconstruct_candidate",
-        "safe_auto_archive_rebuild" => "archive_rebuild_from_sources",
-        "database" => "archive_database_repair",
-        "database_backup" => "archive_database_bundle_move_or_backup",
-        "source_coverage" => "source_coverage_repair",
-        "source_inventory" => "source_authority_repair",
-        "repair_failure_marker" => "repeat_repair",
-        "operation_state" => "mutating_doctor_repair",
-        "derivative_cleanup" => "derived_cleanup",
-        _ => "manual_doctor_review",
+        "semantic_model" => Some("report_lexical_fallback_without_model_download"),
+        "raw_mirror_backfill" => Some("backfill_additive_raw_mirror_metadata"),
+        "candidate_staging" => Some("build_isolated_reconstruct_candidate"),
+        "safe_auto_archive_rebuild" => Some("archive_rebuild_from_sources"),
+        "database" => Some("archive_database_repair"),
+        "database_backup" => Some("archive_database_bundle_move_or_backup"),
+        "source_coverage" => Some("source_coverage_repair"),
+        "source_inventory" => Some("source_authority_repair"),
+        "repair_failure_marker" => Some("repeat_repair"),
+        "operation_state" => Some("mutating_doctor_repair"),
+        "derivative_cleanup" => Some("derived_cleanup"),
+        _ => None,
     }
+}
+
+fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str {
+    doctor_safe_auto_named_action_for_check(check).unwrap_or("manual_doctor_review")
 }
 
 fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static str {
@@ -24925,6 +24929,12 @@ fn build_doctor_safe_auto_run_report(
         }
 
         let data_risk = doctor_data_loss_risk_rank(check.data_loss_risk);
+        if !check.fix_available
+            && !check.fix_applied
+            && doctor_safe_auto_named_action_for_check(check).is_none()
+        {
+            continue;
+        }
         let decision = if check.safe_for_auto_repair
             && input.operation_state.mutating_doctor_allowed
             && input.db_ok
@@ -27963,8 +27973,7 @@ fn doctor_forensic_bundle_id(operation_id: &str, created_at_ms: i64) -> String {
 }
 
 fn doctor_forensic_relative_path_is_safe(relative_path: &Path) -> bool {
-    let raw = relative_path.as_os_str().to_string_lossy();
-    !raw.contains('\\')
+    !relative_path.as_os_str().to_string_lossy().contains('\\')
         && !relative_path.as_os_str().is_empty()
         && !relative_path.is_absolute()
         && relative_path.components().all(|component| match component {
@@ -28018,6 +28027,24 @@ fn doctor_portable_relative_component_is_safe(name: &std::ffi::OsStr) -> bool {
             | "LPT8"
             | "LPT9"
     )
+}
+
+fn doctor_forensic_prefixed_relative_path(prefix: &str, relative_to_root: &Path) -> PathBuf {
+    let mut portable = prefix.to_string();
+    for component in relative_to_root.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                portable.push('/');
+                portable.push_str(&name.to_string_lossy());
+            }
+            std::path::Component::CurDir => {}
+            other => {
+                portable.push('/');
+                portable.push_str(&other.as_os_str().to_string_lossy());
+            }
+        }
+    }
+    PathBuf::from(portable)
 }
 
 fn doctor_forensic_bundle_root_is_safe(data_dir: &Path, root: &Path) -> Result<(), String> {
@@ -28559,7 +28586,8 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
+            let relative =
+                doctor_forensic_prefixed_relative_path("raw-mirror-manifests", relative_to_root);
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -28592,7 +28620,8 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("index-manifests").join(relative_to_root);
+            let relative =
+                doctor_forensic_prefixed_relative_path("index-manifests", relative_to_root);
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
@@ -34273,13 +34302,12 @@ fn doctor_archive_normalize_apply_argv(
     plan_fingerprint: &str,
 ) -> Vec<String> {
     let mut argv = vec!["cass".to_string()];
-    let data_dir_identity = doctor_path_identity_for_fingerprint(data_dir);
     let db_path_identity = doctor_path_identity_for_fingerprint(db_path);
     let default_db_identity =
         doctor_path_identity_for_fingerprint(&data_dir.join("agent_search.db"));
     if db_path_identity != default_db_identity {
         argv.push("--db".to_string());
-        argv.push(db_path_identity);
+        argv.push(doctor_path_for_exact_argv(db_path));
     }
     argv.extend([
         "doctor".to_string(),
@@ -34292,12 +34320,12 @@ fn doctor_archive_normalize_apply_argv(
         argv.push("--json".to_string());
     }
     argv.push("--data-dir".to_string());
-    argv.push(data_dir_identity);
+    argv.push(doctor_path_for_exact_argv(data_dir));
     argv
 }
 
-fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
-    let identity_path = match std::fs::canonicalize(path) {
+fn doctor_resolved_path_for_identity(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
         Ok(canonical) => canonical,
         Err(_) => path
             .parent()
@@ -34309,8 +34337,17 @@ fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
                 })
             })
             .unwrap_or_else(|| path.to_path_buf()),
-    };
-    doctor_path_to_slash_string(&identity_path)
+    }
+}
+
+fn doctor_path_for_exact_argv(path: &Path) -> String {
+    doctor_resolved_path_for_identity(path)
+        .display()
+        .to_string()
+}
+
+fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
+    doctor_path_to_slash_string(&doctor_resolved_path_for_identity(path))
 }
 
 fn doctor_archive_normalize_root_binding(data_dir: &Path, db_path: &Path) -> serde_json::Value {
@@ -36817,7 +36854,7 @@ fn doctor_candidate_live_inventory(
 fn doctor_candidate_relative_path(candidate_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(candidate_dir)
         .ok()
-        .map(|relative| relative.display().to_string())
+        .map(|relative| relative.display().to_string().replace('\\', "/"))
 }
 
 fn doctor_candidate_artifact_class(relative_path: &str) -> DoctorAssetClass {
@@ -40144,6 +40181,20 @@ fn doctor_archive_export_target_artifact_safety(
     }
 }
 
+fn doctor_archive_export_transient_db_lock_sidecar(
+    relative: &str,
+    expected_paths: &BTreeSet<String>,
+) -> bool {
+    const TRANSIENT_LOCK_SUFFIXES: &[&str] = &["-lock-shared", "-lock-reserved", "-lock-pending"];
+
+    expected_paths.iter().any(|expected| {
+        expected.ends_with(".db")
+            && relative
+                .strip_prefix(expected)
+                .is_some_and(|suffix| TRANSIENT_LOCK_SUFFIXES.contains(&suffix))
+    })
+}
+
 fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> serde_json::Value {
     let manifest_path = doctor_archive_export_manifest_path(target_root);
     if let Ok(metadata) = std::fs::symlink_metadata(target_root)
@@ -40299,6 +40350,9 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
                 continue;
             }
             if !expected_paths.contains(&relative) {
+                if doctor_archive_export_transient_db_lock_sidecar(&relative, &expected_paths) {
+                    continue;
+                }
                 issues.push(serde_json::json!({
                     "kind": "extra_file",
                     "path": relative,
@@ -43795,12 +43849,10 @@ fn doctor_baseline_resolve_path(
             .join("baselines")
             .join(format!("{baseline_id}.json"))
     };
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::Prefix(_)
-        )
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(CliError {
             code: 2,
             kind: "usage",
@@ -72549,6 +72601,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "rebuilding": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
@@ -72684,6 +72737,9 @@ fn response_schema_rebuild_state() -> serde_json::Value {
         "type": "object",
         "properties": {
             "active": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
+            "last_progress_at": response_schema_nullable_type("string"),
+            "last_progress_age_ms": response_schema_nullable_type("integer"),
             "orphaned": { "type": "boolean" },
             "pid": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
@@ -72761,6 +72817,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
             "feature_compiled_in": { "type": "boolean" },
+            "quality_tier_published": { "type": "boolean" },
+            "semantic_only_search_available": { "type": "boolean" },
             "hint": { "type": ["string", "null"] },
             "fast_tier": {
                 "type": "object",
@@ -73046,6 +73104,13 @@ fn response_schema_object(
         .into_iter()
         .collect(),
     )
+}
+
+fn response_schema_nullable_type(kind: &str) -> serde_json::Value {
+    let mut types = Vec::with_capacity(2);
+    types.push(serde_json::Value::String(kind.to_owned()));
+    types.push(serde_json::Value::String("null".to_string()));
+    serde_json::json!({ "type": types })
 }
 
 fn response_schema_opaque_object() -> serde_json::Value {
@@ -77168,6 +77233,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
 mod response_schema_tests {
     use super::*;
 
+    fn path_ends_with_portably(path: &str, suffix: &str) -> bool {
+        path.replace('\\', "/").ends_with(suffix)
+    }
+
     #[test]
     fn status_schema_includes_semantic_and_rebuild_truth() {
         let schemas = build_response_schemas();
@@ -77764,7 +77833,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "backup-filter-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77794,7 +77863,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data/raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "cass-data/raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77846,7 +77915,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data-link/raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "cass-data-link/raw-mirror/v1")
             }),
             "logical symlinked data-dir placement should still be checked against repo ignores: {risks:#?}"
         );
@@ -77908,7 +77977,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "sources-config-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_ends_with_portably(&risk.path, "raw-mirror/v1")
             ),
             "sources config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );

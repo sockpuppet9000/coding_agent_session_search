@@ -193,7 +193,7 @@ fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<
 
 #[cfg(windows)]
 pub(crate) fn windows_lock_conflict(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(32 | 33))
+    matches!(err.raw_os_error(), Some(5 | 32 | 33))
 }
 
 #[cfg(not(windows))]
@@ -2198,6 +2198,16 @@ mod tests {
         assert!(!snapshot2.orphaned);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_conflict_treats_access_denied_as_active_lock() {
+        // Windows can report a held lock-file handle as ERROR_ACCESS_DENIED
+        // when the reader opens the file, before fs2 can return the more
+        // specific lock violation codes from try_lock_exclusive.
+        let err = std::io::Error::from_raw_os_error(5);
+        assert!(windows_lock_conflict(&err));
+    }
+
     #[test]
     fn live_owner_metadata_is_preserved_when_flock_is_held() -> std::io::Result<()> {
         // When the lock is actually held by a live owner, the snapshot
@@ -3720,9 +3730,11 @@ mod tests {
         .expect("write lock metadata");
 
         let temp_path = temp.path().to_path_buf();
+        let release_lock_path = lock_path.clone();
         let release_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let _ = owner.set_len(0);
+            let _ = clear_index_run_lock_metadata_sidecar(&release_lock_path);
             let _ = FileExt::unlock(&owner);
             drop(owner);
         });

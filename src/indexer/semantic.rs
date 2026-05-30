@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -194,6 +194,12 @@ pub struct SemanticBackfillBatchOutcome {
     pub published: bool,
     pub index_path: PathBuf,
     pub manifest_path: PathBuf,
+}
+
+pub(crate) struct SemanticContentFingerprint {
+    pub(crate) total_conversations: usize,
+    pub(crate) max_conversation_id: i64,
+    pub(crate) max_message_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +497,125 @@ fn semantic_generation_fingerprint_component(db_fingerprint: &str) -> String {
         .chars()
         .take(16)
         .collect()
+}
+
+pub(crate) fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
+    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
+    let total_conversations = parts.next()?.parse::<usize>().ok()?;
+    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
+    let max_message_id = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(SemanticContentFingerprint {
+        total_conversations,
+        max_conversation_id,
+        max_message_id,
+    })
+}
+
+fn semantic_artifact_for_tier(
+    manifest: &SemanticManifest,
+    tier: TierKind,
+) -> Option<&ArtifactRecord> {
+    match tier {
+        TierKind::Fast => manifest.fast_tier.as_ref(),
+        TierKind::Quality => manifest.quality_tier.as_ref(),
+    }
+}
+
+fn semantic_artifact_index_path(data_dir: &Path, artifact: &ArtifactRecord) -> Result<PathBuf> {
+    let path = PathBuf::from(&artifact.index_path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    let mut resolved = data_dir.to_path_buf();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            bail!(
+                "semantic backfill cannot use unsafe relative vector artifact path {}",
+                artifact.index_path
+            );
+        };
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+fn semantic_wal_path_for_index(index_path: &Path) -> PathBuf {
+    let mut path = index_path.as_os_str().to_os_string();
+    path.push(".wal");
+    PathBuf::from(path)
+}
+
+fn semantic_index_total_record_count(index: &FsVectorIndex) -> u64 {
+    u64::try_from(
+        index
+            .record_count()
+            .saturating_add(index.wal_record_count()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn semantic_index_total_size_bytes(index_path: &Path) -> Result<u64> {
+    let mut size = fs::metadata(index_path)
+        .with_context(|| format!("stat semantic artifact {}", index_path.display()))?
+        .len();
+    let wal_path = semantic_wal_path_for_index(index_path);
+    match fs::metadata(&wal_path) {
+        Ok(meta) => {
+            size = size.saturating_add(meta.len());
+        }
+        Err(err) if err.kind().eq(&std::io::ErrorKind::NotFound) => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("stat semantic WAL {}", wal_path.display()));
+        }
+    }
+    Ok(size)
+}
+
+fn semantic_artifact_matches_backfill_plan(
+    artifact: &ArtifactRecord,
+    tier: TierKind,
+    indexer: &SemanticIndexer,
+    model_revision: &str,
+) -> bool {
+    artifact.ready
+        && artifact.tier == tier
+        && artifact.embedder_id == indexer.embedder_id()
+        && artifact.model_revision == model_revision
+        && artifact.schema_version == SEMANTIC_SCHEMA_VERSION
+        && artifact.chunking_version == CHUNKING_STRATEGY_VERSION
+        && artifact.dimension == indexer.embedder_dimension()
+}
+
+pub(crate) fn semantic_artifact_is_append_only_prefix(
+    storage: &FrankenStorage,
+    artifact_fingerprint: &SemanticContentFingerprint,
+    current_fingerprint: &SemanticContentFingerprint,
+) -> Result<bool> {
+    if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
+        || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
+        || artifact_fingerprint.max_message_id > current_fingerprint.max_message_id
+    {
+        return Ok(false);
+    }
+
+    let prefix_param = ParamValue::from(artifact_fingerprint.max_conversation_id);
+    let prefix_conversations: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*)
+             FROM conversations
+             WHERE id <= ?1",
+            std::slice::from_ref(&prefix_param),
+            |row| row.get_typed(0),
+        )
+        .context("checking semantic backfill append-only prefix conversation count")?;
+    let observed_prefix_conversations =
+        usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
+    Ok(observed_prefix_conversations == artifact_fingerprint.total_conversations)
 }
 
 fn semantic_shard_generation_dir(
@@ -1248,6 +1373,112 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
         packet_driven = true,
         semantic_inputs = inputs.len(),
         "built semantic catch-up batch from ConversationPacket canonical replay"
+    );
+
+    Ok(CanonicalIncrementalEmbeddingBatch {
+        inputs,
+        conversations_in_batch,
+        raw_max_message_id,
+    })
+}
+
+pub(crate) fn packet_embedding_inputs_from_storage_after_content_fingerprint(
+    storage: &FrankenStorage,
+    artifact_fingerprint: &SemanticContentFingerprint,
+) -> Result<CanonicalIncrementalEmbeddingBatch> {
+    let params: Vec<ParamValue> =
+        std::iter::once(ParamValue::from(artifact_fingerprint.max_conversation_id))
+            .chain(std::iter::once(ParamValue::from(
+                artifact_fingerprint.max_message_id,
+            )))
+            .collect();
+
+    let conversation_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT c.id
+             FROM conversations c
+             WHERE (
+                   c.id > ?1
+                   AND EXISTS (
+                       SELECT 1
+                       FROM messages
+                       WHERE conversation_id = c.id
+                       LIMIT 1
+                   )
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM messages
+                   WHERE conversation_id = c.id
+                     AND id > ?2
+                   LIMIT 1
+               )
+             ORDER BY c.id ASC",
+            params.as_slice(),
+            |row| row.get_typed(0),
+        )
+        .with_context(|| {
+            format!(
+                "fetching canonical semantic append-only conversation ids after conversation {} and message {}",
+                artifact_fingerprint.max_conversation_id, artifact_fingerprint.max_message_id
+            )
+        })?;
+
+    if conversation_ids.is_empty() {
+        return Ok(CanonicalIncrementalEmbeddingBatch {
+            inputs: Vec::new(),
+            conversations_in_batch: 0,
+            raw_max_message_id: None,
+        });
+    }
+
+    let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
+    let mut grouped_messages =
+        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let mut inputs = Vec::new();
+    let mut raw_max_message_id: Option<i64> = None;
+    let mut conversations_in_batch = 0u64;
+
+    for conversation in &conversations {
+        let mut messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        messages.retain(|message| {
+            let keep = if conversation.conversation_id > artifact_fingerprint.max_conversation_id {
+                true
+            } else {
+                message
+                    .id
+                    .is_some_and(|id| id > artifact_fingerprint.max_message_id)
+            };
+            if keep && let Some(message_id) = message.id {
+                raw_max_message_id =
+                    Some(raw_max_message_id.map_or(message_id, |current| current.max(message_id)));
+            }
+            keep
+        });
+        if messages.is_empty() {
+            continue;
+        }
+
+        conversations_in_batch = conversations_in_batch.saturating_add(1);
+        let provenance = canonical_embedding_packet_provenance(conversation);
+        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        inputs.extend(embedding_inputs_from_conversation_packet(
+            conversation,
+            &packet,
+        ));
+    }
+
+    tracing::debug!(
+        max_conversation_id = artifact_fingerprint.max_conversation_id,
+        max_message_id = artifact_fingerprint.max_message_id,
+        conversations_in_batch,
+        packet_driven = true,
+        semantic_inputs = inputs.len(),
+        "built semantic append-only batch from ConversationPacket canonical replay"
     );
 
     Ok(CanonicalIncrementalEmbeddingBatch {
@@ -2242,6 +2473,181 @@ impl SemanticIndexer {
         )
     }
 
+    fn run_append_only_backfill_from_ready_artifact(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: &SemanticBackfillStoragePlan,
+    ) -> Result<Option<SemanticBackfillBatchOutcome>> {
+        let Some(artifact) = semantic_artifact_for_tier(manifest, plan.tier).cloned() else {
+            return Ok(None);
+        };
+        if !semantic_artifact_matches_backfill_plan(
+            &artifact,
+            plan.tier,
+            self,
+            &plan.model_revision,
+        ) {
+            return Ok(None);
+        }
+
+        let Some(current_fingerprint) = parse_semantic_content_fingerprint(&plan.db_fingerprint)
+        else {
+            return Ok(None);
+        };
+        let Some(artifact_fingerprint) =
+            parse_semantic_content_fingerprint(&artifact.db_fingerprint)
+        else {
+            return Ok(None);
+        };
+
+        let index_path = semantic_artifact_index_path(data_dir, &artifact)?;
+        let opened_index = FsVectorIndex::open(&index_path).map_err(|err| {
+            anyhow::anyhow!(
+                "open semantic artifact {} for append-only backfill: {err}",
+                index_path.display()
+            )
+        })?;
+        let observed_docs = u64::try_from(opened_index.record_count()).unwrap_or(u64::MAX);
+        let observed_total_docs = semantic_index_total_record_count(&opened_index);
+        drop(opened_index);
+        if observed_total_docs < artifact.doc_count {
+            tracing::warn!(
+                tier = plan.tier.as_str(),
+                embedder = self.embedder_id(),
+                manifest_doc_count = artifact.doc_count,
+                observed_docs,
+                observed_total_docs,
+                "semantic append-only backfill cannot reuse artifact because observed index has fewer docs than the manifest"
+            );
+            return Ok(None);
+        }
+
+        let semantic_total = total_semantic_conversations(storage)?;
+        let manifest_path = SemanticManifest::path(data_dir);
+        if artifact.db_fingerprint == plan.db_fingerprint {
+            let mut refreshed_artifact = artifact;
+            refreshed_artifact.doc_count = observed_total_docs;
+            refreshed_artifact.size_bytes = semantic_index_total_size_bytes(&index_path)?;
+            refreshed_artifact.conversation_count = semantic_total;
+            refreshed_artifact.completed_at_ms = now_ms();
+            manifest.publish_artifact(refreshed_artifact);
+            manifest.refresh_backlog(semantic_total, &plan.db_fingerprint);
+            manifest.save(data_dir)?;
+            return Ok(Some(SemanticBackfillBatchOutcome {
+                tier: plan.tier,
+                embedder_id: self.embedder_id().to_string(),
+                embedded_docs: 0,
+                conversations_processed: semantic_total,
+                total_conversations: semantic_total,
+                last_offset: current_fingerprint.max_conversation_id,
+                checkpoint_saved: false,
+                published: true,
+                index_path,
+                manifest_path,
+            }));
+        }
+
+        if !semantic_artifact_is_append_only_prefix(
+            storage,
+            &artifact_fingerprint,
+            &current_fingerprint,
+        )? {
+            return Ok(None);
+        }
+
+        let batch = packet_embedding_inputs_from_storage_after_content_fingerprint(
+            storage,
+            &artifact_fingerprint,
+        )?;
+        let expected_current_docs = artifact
+            .doc_count
+            .saturating_add(u64::try_from(batch.inputs.len()).unwrap_or(u64::MAX));
+        if observed_total_docs == expected_current_docs {
+            let mut refreshed_artifact = artifact;
+            refreshed_artifact.db_fingerprint = plan.db_fingerprint.clone();
+            refreshed_artifact.conversation_count = semantic_total;
+            refreshed_artifact.doc_count = observed_total_docs;
+            refreshed_artifact.size_bytes = semantic_index_total_size_bytes(&index_path)?;
+            refreshed_artifact.completed_at_ms = now_ms();
+            manifest.publish_artifact(refreshed_artifact);
+            manifest.refresh_backlog(semantic_total, &plan.db_fingerprint);
+            manifest.save(data_dir)?;
+
+            return Ok(Some(SemanticBackfillBatchOutcome {
+                tier: plan.tier,
+                embedder_id: self.embedder_id().to_string(),
+                embedded_docs: 0,
+                conversations_processed: semantic_total,
+                total_conversations: semantic_total,
+                last_offset: current_fingerprint.max_conversation_id,
+                checkpoint_saved: false,
+                published: true,
+                index_path,
+                manifest_path,
+            }));
+        }
+
+        let build_started_at_ms = now_ms();
+        let embedded = self.embed_messages(&batch.inputs)?;
+        let embedded_docs = u64::try_from(embedded.len()).unwrap_or(u64::MAX);
+        let appended = self.append_to_index_path(embedded, &index_path)?;
+        if appended != batch.inputs.len() {
+            bail!(
+                "semantic append-only backfill appended {appended} docs, expected {}",
+                batch.inputs.len()
+            );
+        }
+
+        let published_index = FsVectorIndex::open(&index_path).map_err(|err| {
+            anyhow::anyhow!(
+                "open appended semantic artifact {}: {err}",
+                index_path.display()
+            )
+        })?;
+        let doc_count = semantic_index_total_record_count(&published_index);
+        drop(published_index);
+        let size_bytes = semantic_index_total_size_bytes(&index_path)?;
+        let relative_index_path = index_path
+            .strip_prefix(data_dir)
+            .unwrap_or(index_path.as_path())
+            .to_string_lossy()
+            .to_string();
+
+        manifest.publish_artifact(ArtifactRecord {
+            tier: plan.tier,
+            embedder_id: self.embedder_id().to_string(),
+            model_revision: plan.model_revision.clone(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            dimension: self.embedder_dimension(),
+            doc_count,
+            conversation_count: semantic_total,
+            db_fingerprint: plan.db_fingerprint.clone(),
+            index_path: relative_index_path,
+            size_bytes,
+            started_at_ms: build_started_at_ms,
+            completed_at_ms: now_ms(),
+            ready: true,
+        });
+        manifest.refresh_backlog(semantic_total, &plan.db_fingerprint);
+        manifest.save(data_dir)?;
+
+        Ok(Some(SemanticBackfillBatchOutcome {
+            tier: plan.tier,
+            embedder_id: self.embedder_id().to_string(),
+            embedded_docs,
+            conversations_processed: semantic_total,
+            total_conversations: semantic_total,
+            last_offset: current_fingerprint.max_conversation_id,
+            checkpoint_saved: false,
+            published: true,
+            index_path,
+            manifest_path,
+        }))
+    }
+
     /// Variant of [`run_backfill_from_storage_with_sink`] for CLI backfill
     /// runs. It applies operator checkpoint caps from
     /// `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` and
@@ -2275,6 +2681,19 @@ impl SemanticIndexer {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        let has_valid_checkpoint_for_this_tier =
+            manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint.tier == plan.tier
+                    && checkpoint.embedder_id == self.embedder_id()
+                    && checkpoint.is_valid(&plan.db_fingerprint)
+            });
+        if !has_valid_checkpoint_for_this_tier
+            && let Some(outcome) = self
+                .run_append_only_backfill_from_ready_artifact(storage, data_dir, manifest, &plan)?
+        {
+            return Ok(outcome);
+        }
+
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
             checkpoint.tier == plan.tier
                 && checkpoint.embedder_id == self.embedder_id()
@@ -2301,7 +2720,7 @@ impl SemanticIndexer {
             storage,
             after_conversation_id,
             plan.max_conversations,
-            prior_last_message_id,
+            None,
             caps,
         ) {
             Ok(batch) => batch,
@@ -2320,6 +2739,15 @@ impl SemanticIndexer {
                 return Err(err);
             }
         };
+
+        if batch.inputs.is_empty()
+            && batch.conversations_in_batch == 0
+            && prior_checkpoint.is_some_and(|checkpoint| !checkpoint.is_complete())
+            && let Some(outcome) = self
+                .run_append_only_backfill_from_ready_artifact(storage, data_dir, manifest, &plan)?
+        {
+            return Ok(outcome);
+        }
 
         if sink.is_active() {
             sink.emit(

@@ -187,7 +187,7 @@ fn list_dir_bounded(root: &Path, limit: usize) -> Vec<String> {
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
-                .into_owned();
+                .replace('\\', "/");
             match entry.file_type() {
                 Ok(ft) if ft.is_dir() => {
                     out.push(format!("{rel}/"));
@@ -214,8 +214,7 @@ mod tests {
     /// normally with no panic and no diagnostic noise.
     #[test]
     fn happy_path_returns_output_without_panicking() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("printf 'hi' && exit 0");
+        let cmd = fast_success_command();
         let out = spawn_with_timeout_or_diag(cmd, "happy_path", None, Duration::from_secs(5));
         assert!(out.status.success(), "shell must exit 0");
         assert_eq!(
@@ -236,8 +235,7 @@ mod tests {
         // only the shell, leaving the orphan sleep holding the
         // stdout/stderr pipe FDs open and making the subsequent
         // `read_to_end` in drain_pipe_tail block for the full 30s.
-        let mut cmd = Command::new("/bin/sleep");
-        cmd.arg("30");
+        let cmd = hanging_command();
         let _ =
             spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300));
     }
@@ -287,5 +285,33 @@ mod tests {
             entries.iter().any(|e| e.contains("truncated at 3")),
             "must include the truncated-at marker once limit is exceeded; got: {entries:?}"
         );
+    }
+
+    #[cfg(windows)]
+    fn fast_success_command() -> Command {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "echo hi"]);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    fn fast_success_command() -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'hi' && exit 0");
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn hanging_command() -> Command {
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    fn hanging_command() -> Command {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        cmd
     }
 }

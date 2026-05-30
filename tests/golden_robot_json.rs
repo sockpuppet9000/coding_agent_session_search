@@ -33,6 +33,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
+const LIVE_BYTES_SENTINEL: &str = "[LIVE_BYTES]";
+const REPO_SENTINEL: &str = "[REPO]";
+const TEST_HOME_SENTINEL: &str = "[TEST_HOME]";
+
 /// Build a `cass` binary invocation with the env knobs required for
 /// deterministic test output (no update check, no ambient data-dir surprise).
 fn cass_cmd(test_home: &std::path::Path) -> Command {
@@ -40,6 +44,7 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         // Pin data dir so the test never touches the user's real cache.
         .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
         .env("HOME", test_home)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
@@ -318,6 +323,18 @@ fn normalize_live_robot_values(value: &mut Value) {
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
                 && map.contains_key("agent");
+            let normalize_platform = map.get("os").is_some_and(Value::is_string)
+                && map.get("arch").is_some_and(Value::is_string);
+            let normalize_topology = map.contains_key("topology_class")
+                && map.contains_key("logical_cpus")
+                && map.contains_key("physical_cores");
+            let normalize_reserved_core_policy = map.contains_key("reserved_cores")
+                && map.contains_key("policy")
+                && map.contains_key("reason");
+            let normalize_topology_budget = map.contains_key("topology")
+                && map.contains_key("reserved_core_policy")
+                && map.contains_key("advisory_budgets")
+                && map.contains_key("proof_notes");
             for (key, child) in map.iter_mut() {
                 if key == "response_schemas" || looks_like_json_schema_object(child) {
                     continue;
@@ -333,6 +350,14 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
 
                 match key.as_str() {
+                    "os" if normalize_platform => {
+                        *child = json!("linux");
+                        continue;
+                    }
+                    "arch" if normalize_platform => {
+                        *child = json!("x86_64");
+                        continue;
+                    }
                     "current_capacity_pct" => {
                         *child = json!(100);
                         continue;
@@ -343,6 +368,10 @@ fn normalize_live_robot_values(value: &mut Value) {
                     }
                     "recent_decisions" => {
                         *child = json!([]);
+                        continue;
+                    }
+                    "source" if normalize_topology => {
+                        *child = json!("linux_sysfs");
                         continue;
                     }
                     "topology_class" => {
@@ -367,6 +396,26 @@ fn normalize_live_robot_values(value: &mut Value) {
                     }
                     "smt_threads_per_core" => {
                         *child = json!(2);
+                        continue;
+                    }
+                    "memory_total_bytes" | "memory_available_bytes" => {
+                        if child.is_string() {
+                            *child = json!(LIVE_BYTES_SENTINEL);
+                        } else {
+                            *child = json!(274_877_906_944_u64);
+                        }
+                        continue;
+                    }
+                    "policy" if normalize_reserved_core_policy => {
+                        *child = json!(
+                            "max(default, locality*2_on_large_hosts, smt_width, logical/12) capped at 16"
+                        );
+                        continue;
+                    }
+                    "reason" if normalize_reserved_core_policy => {
+                        *child = json!(
+                            "reserve 16 of 128 logical CPUs for interactive work, IO, and NUMA/LLC service headroom"
+                        );
                         continue;
                     }
                     "semantic_batchers" => {
@@ -395,6 +444,24 @@ fn normalize_live_robot_values(value: &mut Value) {
                         } else {
                             *child = json!(120.0);
                         }
+                        continue;
+                    }
+                    "fallback_active" if normalize_topology_budget => {
+                        *child = json!(false);
+                        continue;
+                    }
+                    "decision_reason" if normalize_topology_budget => {
+                        *child = json!(
+                            "planned from ManyCoreSingleSocket: 128 logical CPUs, 64 physical cores, 1 socket(s), 1 NUMA node(s), 8 LLC group(s)"
+                        );
+                        continue;
+                    }
+                    "proof_notes" if normalize_topology_budget => {
+                        *child = json!([
+                            "advisory only: live controllers keep current conservative settings until explicitly wired",
+                            "CPU budgets prefer physical cores and LLC/NUMA locality over SMT oversubscription",
+                            "RAM caps scale only when MemAvailable is large enough to preserve broad host headroom"
+                        ]);
                         continue;
                     }
                     _ => {}
@@ -618,7 +685,7 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     //    shape-relevant and stay in the golden.
     let home_str = test_home.display().to_string();
     if !home_str.is_empty() {
-        out = out.replace(&home_str, "[TEST_HOME]");
+        out = out.replace(&home_str, TEST_HOME_SENTINEL);
     }
 
     // 3b. Fixture databases can intentionally contain the repository root as
@@ -626,8 +693,17 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     // local checkout path into a public contract golden.
     let repo_root = env!("CARGO_MANIFEST_DIR");
     if !repo_root.is_empty() {
-        out = out.replace(repo_root, "[REPO]");
+        out = out.replace(repo_root, REPO_SENTINEL);
     }
+    out = out.replace("/data/projects/coding_agent_session_search", REPO_SENTINEL);
+
+    // 3c. OS-specific config directories differ across the CI matrix. The
+    // contract here is "cass config path under the isolated test home", not
+    // the host platform's conventional config-root spelling.
+    let mac_config_path =
+        format!("{TEST_HOME_SENTINEL}/Library/Application Support/cass/sources.toml");
+    let canonical_config_path = format!("{TEST_HOME_SENTINEL}/.config/cass/sources.toml");
+    out = out.replace(mac_config_path.as_str(), canonical_config_path.as_str());
 
     // 4. UUIDs.
     let uuid_re =
@@ -747,9 +823,12 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
     ] {
-        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?|null)"#)).unwrap();
         out = re
-            .replace_all(&out, format!(r#""{key}": "[LIVE_BYTES]""#).as_str())
+            .replace_all(
+                &out,
+                format!(r#""{key}": "{LIVE_BYTES_SENTINEL}""#).as_str(),
+            )
             .to_string();
     }
 
@@ -1861,6 +1940,7 @@ fn status_shape_matches_golden() {
         &["status", "--json"],
         ExpectStatus::ExitOk,
     );
+    normalize_live_robot_values(&mut status);
     // Keep the warnings array item schema pinned even when this fixture has no
     // warning instances.
     if let Some(warnings) = status

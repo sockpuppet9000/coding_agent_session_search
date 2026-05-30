@@ -78,7 +78,9 @@ use crate::storage::sqlite::{
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
-    packet_embedding_inputs_from_storage_since,
+    packet_embedding_inputs_from_storage_after_content_fingerprint,
+    packet_embedding_inputs_from_storage_since, parse_semantic_content_fingerprint,
+    semantic_artifact_is_append_only_prefix,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -5246,7 +5248,9 @@ fn acquire_index_run_lock(
         .with_context(|| format!("opening index-run lock file {}", lock_path.display()))?;
 
     if let Err(err) = file.try_lock_exclusive() {
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if err.kind() == std::io::ErrorKind::WouldBlock
+            || crate::search::asset_state::windows_lock_conflict(&err)
+        {
             anyhow::bail!(
                 "another cass index process already holds {}",
                 lock_path.display()
@@ -13083,13 +13087,6 @@ impl WatchSemanticDelta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SemanticContentFingerprint {
-    total_conversations: usize,
-    max_conversation_id: i64,
-    max_message_id: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetedSemanticWatchOnceMode {
     RebuildAll,
     AppendToExisting,
@@ -13121,21 +13118,6 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
             .is_some_and(|paths| !paths.is_empty())
 }
 
-fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
-    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
-    let total_conversations = parts.next()?.parse::<usize>().ok()?;
-    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
-    let max_message_id = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SemanticContentFingerprint {
-        total_conversations,
-        max_conversation_id,
-        max_message_id,
-    })
-}
-
 fn semantic_artifact_for_tier(
     manifest: &SemanticManifest,
     tier: SemanticTierKind,
@@ -13163,6 +13145,39 @@ fn semantic_artifact_index_path(data_dir: &Path, artifact: &ArtifactRecord) -> R
         resolved.push(part);
     }
     Ok(resolved)
+}
+
+fn semantic_watch_once_wal_path_for_index(index_path: &Path) -> PathBuf {
+    let mut path = index_path.as_os_str().to_os_string();
+    path.push(".wal");
+    PathBuf::from(path)
+}
+
+fn semantic_watch_once_index_total_record_count(index: &FsVectorIndex) -> u64 {
+    u64::try_from(
+        index
+            .record_count()
+            .saturating_add(index.wal_record_count()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn semantic_watch_once_index_total_size_bytes(index_path: &Path) -> Result<u64> {
+    let mut size = fs::metadata(index_path)
+        .with_context(|| format!("stat semantic watch-once index {}", index_path.display()))?
+        .len();
+    let wal_path = semantic_watch_once_wal_path_for_index(index_path);
+    match fs::metadata(&wal_path) {
+        Ok(meta) => {
+            size = size.saturating_add(meta.len());
+        }
+        Err(err) if err.kind().eq(&std::io::ErrorKind::NotFound) => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat semantic watch-once WAL {}", wal_path.display()));
+        }
+    }
+    Ok(size)
 }
 
 fn validate_semantic_watch_once_artifact(
@@ -13200,7 +13215,7 @@ fn validate_semantic_watch_once_artifact(
             index_path.display()
         )
     })?;
-    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
+    let observed_docs = semantic_watch_once_index_total_record_count(&index);
     if !observed_docs.eq(&artifact.doc_count) {
         anyhow::bail!(
             "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
@@ -13209,33 +13224,6 @@ fn validate_semantic_watch_once_artifact(
         );
     }
     Ok(index_path)
-}
-
-fn semantic_artifact_is_append_only_prefix(
-    storage: &FrankenStorage,
-    artifact_fingerprint: SemanticContentFingerprint,
-    current_fingerprint: SemanticContentFingerprint,
-) -> Result<bool> {
-    if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
-        || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
-        || artifact_fingerprint.max_message_id > current_fingerprint.max_message_id
-    {
-        return Ok(false);
-    }
-
-    let prefix_conversations: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*)
-             FROM conversations
-             WHERE id <= ?1",
-            &[ParamValue::from(artifact_fingerprint.max_conversation_id)],
-            |row| row.get_typed(0),
-        )
-        .context("checking semantic watch-once prefix conversation count")?;
-    let observed_prefix_conversations =
-        usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
-    Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
 }
 
 fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
@@ -13347,15 +13335,20 @@ fn select_targeted_semantic_watch_once_inputs(
         );
     }
     let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
-    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
-    {
+    if !semantic_artifact_is_append_only_prefix(
+        storage,
+        &artifact_fingerprint,
+        &current_fingerprint,
+    )? {
         anyhow::bail!(
             "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
         );
     }
 
-    let mut batch =
-        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
+    let mut batch = packet_embedding_inputs_from_storage_after_content_fingerprint(
+        storage,
+        &artifact_fingerprint,
+    )?;
     let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
         (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
     });
@@ -13380,14 +13373,7 @@ fn publish_semantic_watch_once_artifact(
     doc_count: u64,
     build_started_at_ms: i64,
 ) -> Result<()> {
-    let size_bytes = fs::metadata(&selection.index_path)
-        .with_context(|| {
-            format!(
-                "stat semantic watch-once index {}",
-                selection.index_path.display()
-            )
-        })?
-        .len();
+    let size_bytes = semantic_watch_once_index_total_size_bytes(&selection.index_path)?;
     let relative_index_path = selection
         .index_path
         .strip_prefix(data_dir)
@@ -13464,11 +13450,11 @@ fn run_targeted_semantic_watch_once_publish(
                     selection.index_path.display()
                 )
             })?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+            semantic_watch_once_index_total_record_count(&index)
         }
         TargetedSemanticWatchOnceMode::RebuildAll => {
             let index = indexer.build_and_save_index(embedded, data_dir)?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+            semantic_watch_once_index_total_record_count(&index)
         }
         TargetedSemanticWatchOnceMode::AppendToExisting => {
             if embedded_docs > 0 {
@@ -13485,7 +13471,7 @@ fn run_targeted_semantic_watch_once_publish(
                     selection.index_path.display()
                 )
             })?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+            semantic_watch_once_index_total_record_count(&index)
         }
     };
 
@@ -15250,6 +15236,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -15266,6 +15253,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -26510,6 +26498,25 @@ mod tests {
         EnvGuard { key, previous }
     }
 
+    fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
+        match std::fs::read_to_string(lock_path) {
+            Ok(raw) => Ok(raw),
+            Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading locked index-run metadata sidecar {} after lock-file read failed with {err}",
+                        sidecar_path.display()
+                    )
+                })
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!("reading index-run lock metadata {}", lock_path.display())
+            }),
+        }
+    }
+
     #[test]
     fn active_session_recent_write_detection_is_watch_opt_in() {
         let tmp = TempDir::new().expect("tempdir");
@@ -26695,7 +26702,7 @@ mod tests {
         // key with a fresh timestamp. Parsing it lets a future change
         // to the field's value type surface as a precise test failure.
         let lock_path = tmp.path().join("index-run.lock");
-        let raw = std::fs::read_to_string(&lock_path)?;
+        let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
         let last_progress_lines: Vec<&str> = raw
             .lines()
             .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
@@ -26782,19 +26789,18 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() {
-        let tmp = TempDir::new().unwrap();
+    fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() -> Result<()> {
+        let tmp = TempDir::new()?;
         let db_path = tmp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"placeholder").unwrap();
-        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
-            .expect("acquire index run lock");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
         let lock_path = tmp.path().join("index-run.lock");
-        let before = std::fs::read_to_string(&lock_path).unwrap();
+        let before = read_index_run_lock_metadata_for_test(&lock_path)?;
         let old_progress = before
             .lines()
             .find_map(|line| line.strip_prefix("last_progress_at_ms="))
             .and_then(|raw| raw.parse::<i64>().ok())
-            .expect("initial progress line");
+            .context("initial progress line")?;
         let bumped_progress = old_progress.saturating_add(1_000);
         guard
             .last_progress_at_ms_atomic
@@ -26804,16 +26810,16 @@ mod tests {
             tmp.path(),
             Some(&guard.metadata_write_lock),
             guard.last_progress_at_ms_atomic.load(Ordering::Relaxed),
-        )
-        .expect("heartbeat should persist indexer-owned progress");
+        )?;
 
-        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path)?;
         let expected_line = format!("last_progress_at_ms={bumped_progress}");
         assert!(
             refreshed.lines().any(|line| line == expected_line),
             "heartbeat must persist the indexer-owned progress bump, got {refreshed:?}"
         );
         drop(guard);
+        Ok(())
     }
 
     #[test]
@@ -39187,7 +39193,7 @@ mod tests {
         );
         let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
         anyhow::ensure!(
-            matches!(index.record_count(), 2),
+            matches!(semantic_watch_once_index_total_record_count(&index), 2),
             "wrong vector record count"
         );
         Ok(())
@@ -39266,7 +39272,7 @@ mod tests {
         );
         let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
         anyhow::ensure!(
-            matches!(index.record_count(), 4),
+            matches!(semantic_watch_once_index_total_record_count(&index), 4),
             "wrong vector record count"
         );
         Ok(())
@@ -39340,7 +39346,7 @@ mod tests {
         );
         let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
         anyhow::ensure!(
-            matches!(index.record_count(), 2),
+            matches!(semantic_watch_once_index_total_record_count(&index), 2),
             "wrong vector record count"
         );
         Ok(())

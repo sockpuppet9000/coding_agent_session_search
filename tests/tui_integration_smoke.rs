@@ -49,10 +49,11 @@ fn make_codex_fixture(root: &Path) {
     let sessions = root.join("sessions/2025/11/21");
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join("rollout-1.jsonl");
-    let sample = r#"{"role":"user","timestamp":1700000000000,"content":"hello world test"}
-{"role":"assistant","timestamp":1700000001000,"content":"hi there from codex"}
-{"role":"user","timestamp":1700000002000,"content":"fix the authentication bug in login.rs"}
-{"role":"assistant","timestamp":1700000003000,"content":"I found the authentication issue in the login module. The session token was not being refreshed correctly."}
+    let sample = r#"{"timestamp":"2025-11-21T10:00:00Z","type":"session_meta","payload":{"id":"tui-smoke-codex","cwd":"/tmp/cass-tui-smoke"}}
+{"timestamp":"2025-11-21T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello world test"}]}}
+{"timestamp":"2025-11-21T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"hi there from codex"}]}}
+{"timestamp":"2025-11-21T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the authentication bug in login.rs"}]}}
+{"timestamp":"2025-11-21T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"I found the authentication issue in the login module. The session token was not being refreshed correctly."}]}}
 "#;
     fs::write(file, sample).unwrap();
 }

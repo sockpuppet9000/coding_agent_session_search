@@ -463,9 +463,16 @@ fn claude_connector_sets_external_id() {
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
+    let expected_external_id: PathBuf = ["projects", "test-proj", "unique-session-id.jsonl"]
+        .iter()
+        .collect();
     assert_eq!(
-        convs[0].external_id,
-        Some("projects/test-proj/unique-session-id.jsonl".to_string())
+        convs[0]
+            .external_id
+            .as_deref()
+            .map(PathBuf::from)
+            .as_deref(),
+        Some(expected_external_id.as_path())
     );
 }
 

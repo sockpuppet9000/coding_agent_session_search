@@ -221,7 +221,7 @@ fn apply_default_fsqlite_read_witness_cap() {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn initialize_startup_environment() {
     // Check for AVX2 support before anything else. The prebuilt ONNX Runtime
     // binary linked by semantic builds can execute AVX2 instructions during
     // startup on x86_64, which crashes pre-AVX2 hosts with SIGILL/STATUS_ILLEGAL_INSTRUCTION.
@@ -251,6 +251,10 @@ fn main() -> anyhow::Result<()> {
     // this must run before try_run_with_parsed_fast.
     apply_default_fsqlite_read_witness_cap();
 
+    apply_default_tantivy_writer_thread_cap();
+}
+
+fn run_cli_main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
@@ -266,8 +270,6 @@ fn main() -> anyhow::Result<()> {
         }
         Err(parsed) => *parsed,
     };
-
-    apply_default_tantivy_writer_thread_cap();
 
     let use_current_thread = matches!(
         parsed.cli.command,
@@ -286,4 +288,30 @@ fn main() -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(err) => handle_fatal_error(err),
     }
+}
+
+#[cfg(windows)]
+fn main() -> anyhow::Result<()> {
+    initialize_startup_environment();
+    std::thread::Builder::new()
+        .name("cass-main".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_cli_main)?
+        .join()
+        .map_err(|panic| {
+            let message = if let Some(message) = panic.downcast_ref::<&str>() {
+                *message
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                message.as_str()
+            } else {
+                "cass main thread panicked"
+            };
+            anyhow::anyhow!("{message}")
+        })?
+}
+
+#[cfg(not(windows))]
+fn main() -> anyhow::Result<()> {
+    initialize_startup_environment();
+    run_cli_main()
 }

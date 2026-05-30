@@ -1077,6 +1077,13 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         Some("Run cass index --full --force-rebuild while a direct reader and cass search poll the same live index"),
     );
     rebuild_running.store(true, Ordering::Relaxed);
+    let overlap_deadline = Instant::now() + Duration::from_secs(5);
+    while (reader_attempts_during_rebuild.load(Ordering::Relaxed) == 0
+        || search_attempts_during_rebuild.load(Ordering::Relaxed) == 0)
+        && Instant::now() < overlap_deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let publish_pause_sentinel = home.join("atomic-publish-overlap-sentinel.json");
     let rebuild_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])

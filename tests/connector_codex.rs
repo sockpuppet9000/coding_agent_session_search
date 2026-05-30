@@ -156,9 +156,10 @@ fn codex_connector_parses_real_tool_call_fixture() {
 
     assert_eq!(conv.agent_slug, "codex");
     assert_eq!(conv.workspace, Some(PathBuf::from("/test/soldier/project")));
+    let expected_external_id: PathBuf = ["2025", "11", "26", "rollout-tool-call"].iter().collect();
     assert_eq!(
-        conv.external_id,
-        Some("2025/11/26/rollout-tool-call".to_string())
+        conv.external_id.as_deref().map(PathBuf::from).as_deref(),
+        Some(expected_external_id.as_path())
     );
     assert_eq!(
         conv.title,
@@ -734,9 +735,12 @@ fn codex_connector_sets_external_id_from_filename() {
 
     let c = &convs[0];
     // external_id is now the relative path from sessions dir for uniqueness across directories
+    let expected_external_id: PathBuf = ["2025", "12", "02", "rollout-unique-id-123"]
+        .iter()
+        .collect();
     assert_eq!(
-        c.external_id,
-        Some("2025/12/02/rollout-unique-id-123".to_string())
+        c.external_id.as_deref().map(PathBuf::from).as_deref(),
+        Some(expected_external_id.as_path())
     );
 }
 
@@ -911,9 +915,14 @@ fn codex_connector_ignores_non_rollout_files() {
     // Only the rollout- prefixed file should be processed
     assert_eq!(convs.len(), 1);
     // external_id is now the relative path from sessions dir for uniqueness across directories
+    let expected_external_id: PathBuf = ["2025", "12", "06", "rollout-valid"].iter().collect();
     assert_eq!(
-        convs[0].external_id,
-        Some("2025/12/06/rollout-valid".to_string())
+        convs[0]
+            .external_id
+            .as_deref()
+            .map(PathBuf::from)
+            .as_deref(),
+        Some(expected_external_id.as_path())
     );
 }
 

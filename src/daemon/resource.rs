@@ -221,6 +221,7 @@ mod tests {
     #[test]
     fn test_resource_monitor_creation() {
         let monitor = ResourceMonitor::new();
+        let _ = monitor.memory_usage();
         #[cfg(target_os = "linux")]
         assert!(monitor.pid > 0);
     }

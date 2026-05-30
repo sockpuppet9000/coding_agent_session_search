@@ -15,6 +15,44 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_jsonl_schema_test", test_name)
 }
 
+fn bash_command() -> Command {
+    Command::new(bash_path())
+}
+
+#[cfg(windows)]
+fn bash_path() -> PathBuf {
+    let candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ];
+
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    PathBuf::from("bash")
+}
+
+#[cfg(not(windows))]
+fn bash_path() -> PathBuf {
+    PathBuf::from("bash")
+}
+
+#[cfg(windows)]
+fn shell_path_arg(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn shell_path_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// Required fields per event type.
 /// Common fields (ts, event, run_id, runner) are checked separately.
 const EVENT_SPECIFIC_FIELDS: &[(&str, &[&str])] = &[
@@ -174,9 +212,9 @@ fn shell_validator_rejects_test_end_without_result_status() {
     )
     .expect("write malformed jsonl fixture");
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg("scripts/validate-e2e-jsonl.sh")
-        .arg(&log_path)
+        .arg(shell_path_arg(&log_path))
         .output()
         .expect("run shell JSONL validator");
 
@@ -231,8 +269,8 @@ fn shell_validator_default_discovery_skips_archived_logs() {
     )
     .expect("write archived jsonl fixture");
 
-    let output = Command::new("bash")
-        .arg(&validator)
+    let output = bash_command()
+        .arg(shell_path_arg(&validator))
         .current_dir(temp.path())
         .output()
         .expect("run shell JSONL validator");

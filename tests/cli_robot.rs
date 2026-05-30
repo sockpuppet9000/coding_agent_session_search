@@ -194,6 +194,29 @@ fn assert_not_initialized_recommended_commands(json: &Value, data_dir: &Path) {
     );
 }
 
+fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path, started_at_ms: i64) -> fs::File {
+    let lock_path = data_dir.join("index-run.lock");
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    lock_file.try_lock_exclusive().expect("hold index lock");
+    let lock_metadata = format!(
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
+        std::process::id(),
+        started_at_ms,
+        db_path.display()
+    );
+    writeln!(lock_file, "{lock_metadata}").expect("write lock metadata");
+    lock_file.flush().expect("flush lock metadata");
+    fs::write(data_dir.join("index-run.lock.meta"), lock_metadata)
+        .expect("write index-run lock metadata sidecar");
+    lock_file
+}
+
 fn hold_active_lexical_rebuild_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -244,25 +267,7 @@ fn hold_active_lexical_rebuild_lock(
     )
     .expect("write rebuild state");
 
-    let lock_path = data_dir.join("index-run.lock");
-    let mut lock_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .expect("open lock file");
-    lock_file.try_lock_exclusive().expect("hold index lock");
-    writeln!(
-        lock_file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
-        std::process::id(),
-        1_733_001_444_000_i64,
-        db_path.display()
-    )
-    .expect("write lock metadata");
-    lock_file.flush().expect("flush lock metadata");
-    lock_file
+    hold_active_index_run_lock(data_dir, db_path, 1_733_001_444_000_i64)
 }
 
 #[test]
@@ -2019,7 +2024,8 @@ fn search_cursor_and_token_budget() {
 
 #[test]
 fn search_cursor_jsonl_and_compact() {
-    let data_dir = "tests/fixtures/search_demo_data";
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("temp fixture path is utf-8");
     // JSONL meta line contains next_cursor
     let mut cmd = base_cmd();
     cmd.args([
@@ -2293,7 +2299,18 @@ fn capabilities_matches_golden_contract() {
         "crate_version should match Cargo.toml version"
     );
 
+    #[cfg(not(unix))]
+    let expected = expected_without_unix_only_commands(expected);
+
     assert_eq!(actual, expected, "capabilities contract drifted");
+}
+
+#[cfg(not(unix))]
+fn expected_without_unix_only_commands(mut expected: Value) -> Value {
+    if let Some(commands) = expected["commands"].as_array_mut() {
+        commands.retain(|command| command["name"].as_str() != Some("daemon"));
+    }
+    expected
 }
 
 #[test]
@@ -2672,10 +2689,11 @@ fn search_no_match_returns_empty_hits() {
 // eliminates the mock-code surface entirely.
 
 #[test]
-fn search_writes_trace_on_success() {
+fn search_writes_trace_on_success() -> Result<(), Box<dyn Error>> {
     // E2E test: trace file captures successful search (yln.5)
     let tmp = TempDir::new().unwrap();
     let trace_path = tmp.path().join("search_trace.jsonl");
+    let fixture = isolated_search_demo_data()?;
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -2685,7 +2703,7 @@ fn search_writes_trace_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
     ]);
 
     cmd.assert().success();
@@ -2702,6 +2720,7 @@ fn search_writes_trace_on_success() {
         "Successful search should have exit_code 0"
     );
     assert_eq!(json["contract_version"], "1");
+    Ok(())
 }
 
 #[test]
@@ -3095,7 +3114,21 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
 fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
     let db_path = data_dir.path().join("agent_search.db");
-    let _lock = hold_active_lexical_rebuild_lock(data_dir.path(), &db_path, true, None);
+    let mut index = base_cmd();
+    index.args([
+        "index",
+        "--full",
+        "--force-rebuild",
+        "--json",
+        "--no-progress-events",
+        "--data-dir",
+        data_dir.path().to_str().expect("utf8 fixture path"),
+        "--db",
+        db_path.to_str().expect("utf8 fixture db path"),
+    ]);
+    index.assert().success();
+
+    let _lock = hold_active_index_run_lock(data_dir.path(), &db_path, 1_733_001_444_000_i64);
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -3107,6 +3140,8 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<()
         "1",
         "--data-dir",
         data_dir.path().to_str().expect("utf8 fixture path"),
+        "--db",
+        db_path.to_str().expect("utf8 fixture db path"),
     ]);
 
     let assert = cmd.assert().success();
@@ -4379,30 +4414,7 @@ fn doctor_not_initialized_ignores_active_lock_for_other_db() {
     let data_dir = tmp.path();
     let db_path = data_dir.join("agent_search.db");
     let other_db_path = data_dir.join("other-agent-search.db");
-    let lock_path = data_dir.join("index-run.lock");
-
-    let mut lock_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .unwrap();
-    lock_file.try_lock_exclusive().unwrap();
-    writeln!(
-        lock_file,
-        "pid={}
-started_at_ms={}
-db_path={}
-mode=index
-job_kind=lexical_refresh
-phase=rebuilding",
-        std::process::id(),
-        1_733_001_222_000_i64,
-        other_db_path.display()
-    )
-    .unwrap();
-    lock_file.flush().unwrap();
+    let _lock_file = hold_active_index_run_lock(data_dir, &other_db_path, 1_733_001_222_000_i64);
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -5254,14 +5266,15 @@ fn normalize_flag_case() {
 
 /// Subcommand aliases should work: find → search
 #[test]
-fn subcommand_alias_find_to_search() {
+fn subcommand_alias_find_to_search() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let mut cmd = base_cmd();
     cmd.args([
         "find",
         "test query",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
     ]);
     // 'find' should be normalized to 'search'
     // May succeed or fail based on search results, but should not fail on parsing
@@ -5269,6 +5282,7 @@ fn subcommand_alias_find_to_search() {
     // If command is recognized, it should either succeed or fail with a search-related error
     // not a "command not found" error
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
+    Ok(())
 }
 
 /// Subcommand alias: query → search
@@ -6116,16 +6130,18 @@ fn introspect_matches_golden_contract_structure() {
 
 /// Exit code 0: Success for valid search
 #[test]
-fn exit_code_0_success_search() {
+fn exit_code_0_success_search() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let mut cmd = base_cmd();
     cmd.args([
         "search",
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
     ]);
     cmd.assert().code(0);
+    Ok(())
 }
 
 /// Exit code 0: Success for valid stats

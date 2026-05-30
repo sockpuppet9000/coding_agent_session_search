@@ -73,6 +73,7 @@ fn doctor_e2e_snapshot_diff_detects_timestamp_only_rewrites() {
                 size_bytes: 128,
                 modified_unix_ms: Some(1_733_000_000_000),
                 blake3: Some("same-hash".to_string()),
+                hash_error: None,
             }],
         }],
     };
@@ -85,6 +86,7 @@ fn doctor_e2e_snapshot_diff_detects_timestamp_only_rewrites() {
                 size_bytes: 128,
                 modified_unix_ms: Some(1_733_000_000_999),
                 blake3: Some("same-hash".to_string()),
+                hash_error: None,
             }],
         }],
     };
@@ -1480,7 +1482,9 @@ fn doctor_e2e_manifest_validation_rejects_non_portable_artifact_paths() {
     let err = validate_artifact_manifest_value(temp.path(), &manifest)
         .expect_err("non-portable artifact paths rejected");
     assert!(
-        err.contains("non-portable component") || err.contains("unsafe component"),
+        err.contains("non-portable component")
+            || err.contains("unsafe component")
+            || err.contains("invalid artifact relative path"),
         "manifest validator should reject Windows-style artifact paths, got: {err}"
     );
 }

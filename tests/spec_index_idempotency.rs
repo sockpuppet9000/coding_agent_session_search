@@ -20,8 +20,8 @@
 //! This file pins three invariants:
 //!
 //! 1. Two consecutive `cass index --json` invocations against the same
-//!    stable corpus produce stable `conversations` and `messages`
-//!    total counts. No double-counting, no under-counting.
+//!    stable corpus leave the canonical SQLite `conversations` and
+//!    `messages` totals stable. No double-counting, no under-counting.
 //! 2. The first run's `lexical_strategy` is `"inline_rebuild_from_scan"`
 //!    (the rebuild fast-path).
 //! 3. The second run's `lexical_strategy` is `"incremental_inline"`
@@ -40,6 +40,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -136,6 +138,17 @@ fn message_count(envelope: &Value) -> Result<i64, Box<dyn Error>> {
         .ok_or_else(|| test_error(format!("envelope missing integer `messages`: {envelope}")))
 }
 
+fn archive_counts(data_dir: &Path) -> Result<(i64, i64), Box<dyn Error>> {
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
+    let conversations = conn.query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+        row.get_typed(0)
+    })?;
+    let messages =
+        conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+    Ok((conversations, messages))
+}
+
 #[test]
 fn first_index_uses_inline_rebuild_strategy_against_fresh_data_dir() -> TestResult {
     let (tmp, project, data) = install_aider_fixture_project()?;
@@ -189,24 +202,30 @@ fn consecutive_indexes_produce_stable_conversation_and_message_totals() -> TestR
     let envelope1 = run_index_in(&project, &data, tmp.path())?;
     let envelope2 = run_index_in(&project, &data, tmp.path())?;
 
-    let conv1 = conversation_count(&envelope1)?;
-    let conv2 = conversation_count(&envelope2)?;
-    let msg1 = message_count(&envelope1)?;
-    let msg2 = message_count(&envelope2)?;
+    let first_run_conversations = conversation_count(&envelope1)?;
+    let second_run_conversations = conversation_count(&envelope2)?;
+    let first_run_messages = message_count(&envelope1)?;
+    let second_run_messages = message_count(&envelope2)?;
+    let (archive_conversations, archive_messages) = archive_counts(&data)?;
 
     ensure(
-        matches!(conv1.cmp(&conv2), Ordering::Equal),
+        matches!(
+            first_run_conversations.cmp(&archive_conversations),
+            Ordering::Equal
+        ),
         format!(
-            "conversation counts drifted across consecutive idempotent runs: \
-             first={conv1}, second={conv2}. Either the planner is double-counting \
-             or the source is being re-discovered as new on every run."
+            "canonical conversation total drifted across consecutive idempotent runs: \
+             first_run={first_run_conversations}, second_run_delta={second_run_conversations}, \
+             archive_total={archive_conversations}. Either the planner is double-counting \
+             or the source was dropped after the no-op incremental run."
         ),
     )?;
     ensure(
-        matches!(msg1.cmp(&msg2), Ordering::Equal),
+        matches!(first_run_messages.cmp(&archive_messages), Ordering::Equal),
         format!(
-            "message counts drifted across consecutive idempotent runs: \
-             first={msg1}, second={msg2}."
+            "canonical message total drifted across consecutive idempotent runs: \
+             first_run={first_run_messages}, second_run_delta={second_run_messages}, \
+             archive_total={archive_messages}."
         ),
     )?;
     Ok(())

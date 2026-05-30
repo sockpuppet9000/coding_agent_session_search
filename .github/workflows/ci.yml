@@ -406,7 +406,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t tests < <(git ls-files 'tests/e2e_*.rs' | sed 's#^tests/##; s#\\.rs$##')
+          tests=()
+          while IFS= read -r path; do
+            test_name="${path#tests/}"
+            tests+=("${test_name%.rs}")
+          done < <(git ls-files 'tests/e2e_*.rs')
           if [[ "${#tests[@]}" -eq 0 ]]; then
             echo "No e2e_* tests found; skipping."
             exit 0
@@ -500,7 +504,7 @@ jobs:
   e2e-orchestrated:
     name: E2E Orchestrator (Rust + Shell)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
