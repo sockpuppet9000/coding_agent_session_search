@@ -2688,10 +2688,11 @@ fn search_no_match_returns_empty_hits() {
 // eliminates the mock-code surface entirely.
 
 #[test]
-fn search_writes_trace_on_success() {
+fn search_writes_trace_on_success() -> Result<(), Box<dyn Error>> {
     // E2E test: trace file captures successful search (yln.5)
     let tmp = TempDir::new().unwrap();
     let trace_path = tmp.path().join("search_trace.jsonl");
+    let fixture = isolated_search_demo_data()?;
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -2701,7 +2702,7 @@ fn search_writes_trace_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
     ]);
 
     cmd.assert().success();
@@ -2718,6 +2719,7 @@ fn search_writes_trace_on_success() {
         "Successful search should have exit_code 0"
     );
     assert_eq!(json["contract_version"], "1");
+    Ok(())
 }
 
 #[test]
