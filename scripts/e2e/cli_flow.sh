@@ -148,8 +148,30 @@ PY
 
 STEP_JSONS=()
 FAILED_STEPS=()
+ACTIVE_STEP_NAME=""
+ACTIVE_STEP_START_MS=0
 START_MS=$(now_ms)
 START_ISO=$(now_iso)
+
+finish_active_step() {
+    local reason="${1:-interrupted before step completed}"
+    if [[ -z "$ACTIVE_STEP_NAME" ]]; then
+        return 0
+    fi
+
+    local end_ms
+    local duration_ms
+    end_ms=$(now_ms)
+    duration_ms=$((end_ms - ACTIVE_STEP_START_MS))
+
+    e2e_test_fail "$ACTIVE_STEP_NAME" "cli_flow" "$duration_ms" 0 "$reason" "Interrupted"
+    FAILED_STEPS+=("${ACTIVE_STEP_NAME}")
+    ACTIVE_STEP_NAME=""
+    ACTIVE_STEP_START_MS=0
+}
+
+trap 'finish_active_step "shell_cli_flow interrupted by signal"; exit 130' INT TERM
+trap 'finish_active_step "shell_cli_flow exited before active step completed"' EXIT
 
 run_step() {
     local name=$1
@@ -163,6 +185,8 @@ run_step() {
 
     start_ms=$(now_ms)
     e2e_test_start "$name" "cli_flow"
+    ACTIVE_STEP_NAME="$name"
+    ACTIVE_STEP_START_MS="$start_ms"
 
     log PHASE "STEP: ${name}"
     log INFO "Command: $*"
@@ -186,6 +210,8 @@ run_step() {
             log ERROR "Fail-fast enabled; aborting after ${name}."
         fi
     fi
+    ACTIVE_STEP_NAME=""
+    ACTIVE_STEP_START_MS=0
 
     local cmd_str
     cmd_str=$(printf '%q ' "$@")
@@ -233,6 +259,7 @@ emit_snapshot() {
   "CASS_DATA_DIR": "__CASS_DATA_DIR__",
   "CASS_DB_PATH": "__CASS_DB_PATH__",
   "CODEX_HOME": "__CODEX_HOME__",
+  "CLAUDE_CONFIG_DIR": "__CLAUDE_CONFIG_DIR__",
   "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT": "1",
   "NO_COLOR": "1",
   "CASS_NO_COLOR": "1"
@@ -244,6 +271,7 @@ EOSNAPSHOT
     env_json=${env_json/__CASS_DATA_DIR__/$(json_escape "$DATA_DIR")}
     env_json=${env_json/__CASS_DB_PATH__/$(json_escape "$DB_PATH")}
     env_json=${env_json/__CODEX_HOME__/$(json_escape "$CODEX_HOME")}
+    env_json=${env_json/__CLAUDE_CONFIG_DIR__/$(json_escape "$CLAUDE_HOME")}
 
     config_json=$(cat <<'EOSNAPSHOT'
 {
@@ -385,6 +413,7 @@ emit_snapshot
 CASS_ENV=(
     "HOME=${SANDBOX_DIR}"
     "CODEX_HOME=${CODEX_HOME}"
+    "CLAUDE_CONFIG_DIR=${CLAUDE_HOME}"
     "CASS_DATA_DIR=${DATA_DIR}"
     "CASS_DB_PATH=${DB_PATH}"
     "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1"

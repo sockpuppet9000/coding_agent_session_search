@@ -707,19 +707,17 @@ fn filter_by_workspace() {
     fs::create_dir_all(&data_dir).unwrap();
 
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_claude = EnvGuard::set("CLAUDE_CONFIG_DIR", claude_home.to_string_lossy());
 
-    let workspace_alpha = home
-        .join("projects")
-        .join("workspace-alpha")
-        .to_string_lossy()
-        .to_string();
-    let workspace_beta = home
-        .join("projects")
-        .join("workspace-beta")
-        .to_string_lossy()
-        .to_string();
+    let workspace_alpha_path = home.join("projects").join("workspace-alpha");
+    let workspace_beta_path = home.join("projects").join("workspace-beta");
+    let workspace_alpha = workspace_alpha_path.to_string_lossy().to_string();
+    let workspace_beta = workspace_beta_path.to_string_lossy().to_string();
 
     let ps = tracker.start("setup_fixtures", Some("Create workspace-specific sessions"));
+    fs::create_dir_all(&workspace_alpha_path).unwrap();
+    fs::create_dir_all(&workspace_beta_path).unwrap();
+
     let project_a = claude_home.join("projects/project-a");
     fs::create_dir_all(&project_a).unwrap();
     let sample_a = [
@@ -774,6 +772,7 @@ fn filter_by_workspace() {
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
+        .env("CLAUDE_CONFIG_DIR", &claude_home)
         .assert()
         .success();
     tracker.end("run_index", Some("Run full index"), ps);
@@ -788,6 +787,7 @@ fn filter_by_workspace() {
         .args(["--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
+        .env("CLAUDE_CONFIG_DIR", &claude_home)
         .output()
         .expect("search command");
     let filter_duration = ps.elapsed().as_millis() as u64;
