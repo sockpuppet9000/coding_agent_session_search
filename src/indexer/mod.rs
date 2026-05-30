@@ -15328,7 +15328,13 @@ fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<
 
 #[cfg(windows)]
 fn windows_lexical_publish_rename_is_transient(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(5 | 32)) || err.kind() == std::io::ErrorKind::PermissionDenied
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    matches!(
+        err.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+    )
 }
 
 #[cfg(target_os = "linux")]
