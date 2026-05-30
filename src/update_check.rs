@@ -1504,8 +1504,7 @@ mod tests {
         response_body: &str,
         status: u16,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
-        use std::io::{ErrorKind, Read, Write};
-        use std::net::Shutdown;
+        use std::io::ErrorKind;
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
@@ -1516,56 +1515,24 @@ mod tests {
         let response = http_response(status, response_body);
 
         let handle = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(err)
-                        if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => return,
-                }
-            };
-
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut request_bytes = Vec::new();
-            let mut buf = [0u8; 1024];
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        request_bytes.extend_from_slice(&buf[..read]);
-                        if request_bytes
-                            .windows(b"\r\n\r\n".len())
-                            .any(|window| window == b"\r\n\r\n")
-                        {
-                            break;
-                        }
+                let mut stream = loop {
+                    if Instant::now() >= deadline {
+                        return;
                     }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
-                        ) =>
-                    {
-                        if request_bytes.is_empty() {
-                            return;
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
                         }
-                        break;
+                        Err(_) => return,
                     }
-                    Err(_) => return,
-                }
-            }
+                };
 
-            match stream.write_all(response.as_bytes()) {
-                Ok(()) => {
-                    let _ = stream.flush();
-                    let _ = stream.shutdown(Shutdown::Write);
+                if handle_test_server_connection(&mut stream, &response) {
+                    return;
                 }
-                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                Err(_) => {}
             }
         });
 
@@ -1573,6 +1540,56 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         (addr, handle)
+    }
+
+    fn handle_test_server_connection(stream: &mut std::net::TcpStream, response: &str) -> bool {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::Shutdown;
+        use std::time::Duration;
+
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request_bytes = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    request_bytes.extend_from_slice(&buf[..read]);
+                    if request_bytes
+                        .windows(b"\r\n\r\n".len())
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    if request_bytes.is_empty() {
+                        return false;
+                    }
+                    break;
+                }
+                Err(_) => return false,
+            }
+        }
+
+        if request_bytes.is_empty() {
+            return false;
+        }
+
+        match stream.write_all(response.as_bytes()) {
+            Ok(()) => {
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+                true
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => false,
+            Err(_) => false,
+        }
     }
 
     #[test]
