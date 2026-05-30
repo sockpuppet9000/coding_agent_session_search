@@ -194,6 +194,10 @@ fn conversation_by_external_id<'a>(
     conversations: &'a [NormalizedConversation],
     external_id: &Path,
 ) -> &'a NormalizedConversation {
+    let missing_message = format!(
+        "missing conversation with external_id {}",
+        external_id.display()
+    );
     conversations
         .iter()
         .find(|conversation| {
@@ -202,12 +206,7 @@ fn conversation_by_external_id<'a>(
                 .as_deref()
                 .is_some_and(|id| external_id_matches_path(id, external_id))
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "missing conversation with external_id {}",
-                external_id.display()
-            )
-        })
+        .expect(&missing_message)
 }
 
 #[test]

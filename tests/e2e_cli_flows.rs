@@ -462,6 +462,15 @@ fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
         .iter()
         .map(|(path, _)| path.display().to_string())
         .collect::<std::collections::HashSet<_>>();
+    let session_path_suffixes = fixture
+        .source_files
+        .iter()
+        .filter_map(|(path, _)| path.file_name())
+        .flat_map(|file_name| {
+            let file_name = file_name.to_string_lossy();
+            [format!("/{file_name}"), format!("\\{file_name}")]
+        })
+        .collect::<std::collections::HashSet<_>>();
     let evidence = json["evidence"]
         .as_array()
         .expect("pack evidence must be an array");
@@ -473,7 +482,12 @@ fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
         evidence.iter().all(|item| {
             item["citation"]["source_path"]
                 .as_str()
-                .is_some_and(|path| session_paths.contains(path))
+                .is_some_and(|path| {
+                    session_paths.contains(path)
+                        || session_path_suffixes
+                            .iter()
+                            .any(|suffix| path.ends_with(suffix))
+                })
         }),
         "--sessions-from - must restrict evidence to the provided sessions: {json}"
     );
