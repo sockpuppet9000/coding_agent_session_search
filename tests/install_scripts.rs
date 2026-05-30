@@ -120,6 +120,7 @@ fn start_http_fixture_server(routes: Vec<(&str, Vec<u8>, &str)>) -> HttpFixtureS
 }
 
 fn handle_http_request(mut stream: TcpStream, routes: &BTreeMap<String, (Vec<u8>, String)>) {
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut request_bytes = Vec::new();
     let mut buffer = [0_u8; 1024];

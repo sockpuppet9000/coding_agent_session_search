@@ -867,7 +867,7 @@ async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelea
     )
     .await
     .map_err(|e| anyhow::anyhow!("timed out fetching release: {e}"))?
-    .context("fetching release")?;
+    .map_err(|e| anyhow::anyhow!("fetching release: {e}"))?;
 
     if !response.is_success() {
         anyhow::bail!("GitHub API returned {}", response.status);
@@ -1547,6 +1547,7 @@ mod tests {
         use std::net::Shutdown;
         use std::time::Duration;
 
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut request_bytes = Vec::new();
         let mut buf = [0u8; 1024];
@@ -1590,6 +1591,13 @@ mod tests {
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => false,
             Err(_) => false,
         }
+    }
+
+    fn error_chain_text(err: &anyhow::Error) -> String {
+        err.chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ")
     }
 
     #[test]
@@ -1644,10 +1652,11 @@ mod tests {
 
         assert!(result.is_err(), "should return error for 404");
         let err = result.unwrap_err();
+        let err_text = error_chain_text(&err);
         assert!(
-            err.to_string().contains("404") || err.to_string().contains("Not Found"),
+            err_text.contains("404") || err_text.contains("Not Found"),
             "error should mention 404: {}",
-            err
+            err_text
         );
     }
 
