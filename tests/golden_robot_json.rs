@@ -41,6 +41,7 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         // Pin data dir so the test never touches the user's real cache.
         .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
         .env("HOME", test_home)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
@@ -334,6 +335,18 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
 
                 match key.as_str() {
+                    "platform" => {
+                        if let Some(platform) = child.as_object_mut()
+                            && platform.get("os").is_some_and(serde_json::Value::is_string)
+                            && platform
+                                .get("arch")
+                                .is_some_and(serde_json::Value::is_string)
+                        {
+                            platform.insert("os".to_string(), json!("[OS]"));
+                            platform.insert("arch".to_string(), json!("[ARCH]"));
+                            continue;
+                        }
+                    }
                     "current_capacity_pct" => {
                         *child = json!(100);
                         continue;
@@ -573,7 +586,11 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
             "agent": "codex",
             "snippet": "historical private snippet",
             "content": "historical private content"
-        }]
+        }],
+        "platform": {
+            "os": "linux",
+            "arch": "x86_64"
+        }
     }))
     .expect("serialize fixture");
 
@@ -594,6 +611,8 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
     assert_eq!(scrubbed["results"][1]["workspace"], "[REPO]");
     assert_eq!(scrubbed["results"][1]["snippet"], "[RESULT_SNIPPET]");
     assert_eq!(scrubbed["results"][1]["content"], "[RESULT_CONTENT]");
+    assert_eq!(scrubbed["platform"]["os"], "[OS]");
+    assert_eq!(scrubbed["platform"]["arch"], "[ARCH]");
     assert!(
         !serde_json::to_string(&scrubbed)
             .expect("serialize scrubbed fixture")
