@@ -24945,7 +24945,7 @@ fn build_doctor_safe_auto_run_report(
             continue;
         }
         // Provider directory discovery is diagnostic; it is not a repair gate for derived assets.
-        if check.name == "sessions" && !check.fix_available && !check.fix_applied {
+        if check.name.eq("sessions") && !check.fix_available && !check.fix_applied {
             continue;
         }
         let action = doctor_safe_auto_action_for_check(check).to_string();
