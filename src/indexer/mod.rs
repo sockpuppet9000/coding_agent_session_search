@@ -15297,7 +15297,38 @@ fn rename_lexical_publish_path(
     maybe_inject_lexical_publish_rename_failure(site)?;
     #[cfg(not(test))]
     let _ = site;
+    rename_lexical_publish_path_inner(src, dst)
+}
+
+#[cfg(not(windows))]
+fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: usize = 50;
+    const SLEEP_MS: u64 = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(err) if windows_lexical_publish_rename_is_transient(&err) => {
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                thread::sleep(Duration::from_millis(SLEEP_MS));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn windows_lexical_publish_rename_is_transient(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(5 | 32)) || err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 #[cfg(target_os = "linux")]
