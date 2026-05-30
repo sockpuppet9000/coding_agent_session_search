@@ -2298,7 +2298,18 @@ fn capabilities_matches_golden_contract() {
         "crate_version should match Cargo.toml version"
     );
 
+    #[cfg(not(unix))]
+    let expected = expected_without_unix_only_commands(expected);
+
     assert_eq!(actual, expected, "capabilities contract drifted");
+}
+
+#[cfg(not(unix))]
+fn expected_without_unix_only_commands(mut expected: Value) -> Value {
+    if let Some(commands) = expected["commands"].as_array_mut() {
+        commands.retain(|command| command["name"].as_str() != Some("daemon"));
+    }
+    expected
 }
 
 #[test]

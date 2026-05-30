@@ -5248,7 +5248,9 @@ fn acquire_index_run_lock(
         .with_context(|| format!("opening index-run lock file {}", lock_path.display()))?;
 
     if let Err(err) = file.try_lock_exclusive() {
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if err.kind() == std::io::ErrorKind::WouldBlock
+            || crate::search::asset_state::windows_lock_conflict(&err)
+        {
             anyhow::bail!(
                 "another cass index process already holds {}",
                 lock_path.display()
