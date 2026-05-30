@@ -4750,6 +4750,8 @@ fn status_human_readable_output() -> Result<(), Box<dyn Error>> {
 #[test]
 fn aggregate_single_field_returns_buckets() {
     // rob.flow.agg: --aggregate agent should return agent buckets
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4758,7 +4760,7 @@ fn aggregate_single_field_returns_buckets() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let assert = cmd.assert().success();
@@ -4799,6 +4801,8 @@ fn aggregate_single_field_returns_buckets() {
 #[test]
 fn aggregate_multiple_fields_returns_all() {
     // rob.flow.agg: --aggregate agent,workspace returns both aggregations
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4807,7 +4811,7 @@ fn aggregate_multiple_fields_returns_all() {
         "--aggregate",
         "agent,workspace",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let assert = cmd.assert().success();
@@ -4826,6 +4830,8 @@ fn aggregate_multiple_fields_returns_all() {
 #[test]
 fn aggregate_includes_total_matches() {
     // rob.flow.agg: Aggregation response includes total_matches
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4834,7 +4840,7 @@ fn aggregate_includes_total_matches() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let assert = cmd.assert().success();
@@ -4857,6 +4863,8 @@ fn aggregate_includes_total_matches() {
 #[test]
 fn aggregate_with_limit_returns_both_hits_and_aggs() {
     // rob.flow.agg: --aggregate with --limit returns both aggregations and hits
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4867,7 +4875,7 @@ fn aggregate_with_limit_returns_both_hits_and_aggs() {
         "--limit",
         "2",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let assert = cmd.assert().success();
@@ -4892,6 +4900,8 @@ fn aggregate_with_limit_returns_both_hits_and_aggs() {
 #[test]
 fn aggregate_match_type_returns_exact_wildcard_buckets() {
     // rob.flow.agg: --aggregate match_type returns match type distribution
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4900,7 +4910,7 @@ fn aggregate_match_type_returns_exact_wildcard_buckets() {
         "--aggregate",
         "match_type",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let assert = cmd.assert().success();
@@ -4935,6 +4945,8 @@ fn aggregate_match_type_returns_exact_wildcard_buckets() {
 #[test]
 fn aggregate_empty_query_returns_aggs() {
     // rob.flow.agg: Empty query with aggregation returns all-document aggregations
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4943,7 +4955,7 @@ fn aggregate_empty_query_returns_aggs() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let assert = cmd.assert().success();
@@ -4962,6 +4974,8 @@ fn aggregate_empty_query_returns_aggs() {
 fn aggregate_preserves_offset_when_not_aggregating() {
     // Verify that regular offset functionality is not broken by aggregation code
     // This is a regression test for the offset=0 bug fix
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("utf8 fixture path");
     let mut cmd_no_agg = base_cmd();
     cmd_no_agg.args([
         "search",
@@ -4972,7 +4986,7 @@ fn aggregate_preserves_offset_when_not_aggregating() {
         "--offset",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     let output = cmd_no_agg.assert().success().get_output().clone();
