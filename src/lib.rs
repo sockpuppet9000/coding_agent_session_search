@@ -24944,6 +24944,10 @@ fn build_doctor_safe_auto_run_report(
         if check.status == "pass" && !check.fix_applied {
             continue;
         }
+        // Provider directory discovery is diagnostic; it is not a repair gate for derived assets.
+        if check.name == "sessions" && !check.fix_available && !check.fix_applied {
+            continue;
+        }
         let action = doctor_safe_auto_action_for_check(check).to_string();
         if check.fix_applied {
             report.evaluated_findings.push(DoctorSafeAutoRunFinding {
@@ -30251,15 +30255,7 @@ fn doctor_config_exclusion_targets(
 }
 
 fn doctor_path_to_slash_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
-            std::path::Component::RootDir => Some("/".into()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-        .replace("//", "/")
+    path.as_os_str().to_string_lossy().replace('\\', "/")
 }
 
 fn doctor_pattern_matches_relative_path(raw_pattern: &str, relative_path: &Path) -> bool {
@@ -39827,6 +39823,15 @@ fn doctor_archive_export_relative_is_safe(relative_path: &str) -> bool {
     doctor_forensic_relative_path_is_safe(Path::new(relative_path))
 }
 
+fn doctor_archive_export_extra_file_is_ignorable_probe_lock(relative_path: &str) -> bool {
+    matches!(
+        relative_path,
+        "data/agent_search.db-lock-pending"
+            | "data/agent_search.db-lock-reserved"
+            | "data/agent_search.db-lock-shared"
+    )
+}
+
 fn doctor_archive_export_asset_id(
     relative_path: &str,
     asset_class: DoctorAssetClass,
@@ -40362,7 +40367,8 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
                 "archive-export-manifest.json"
                     | "archive-export-receipt.json"
                     | "archive-export-event-log.json"
-            ) {
+            ) || doctor_archive_export_extra_file_is_ignorable_probe_lock(&relative)
+            {
                 continue;
             }
             if !expected_paths.contains(&relative) {
@@ -43850,6 +43856,26 @@ fn doctor_baseline_resolve_path(
     requested_path: Option<&PathBuf>,
     writes_baseline: bool,
 ) -> CliResult<PathBuf> {
+    if let Some(path) = requested_path
+        && !path.is_absolute()
+        && path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message: format!(
+                "doctor baseline path is not portable-safe: {}",
+                path.display()
+            ),
+            hint: Some("Use a simple baseline id or an absolute JSON file path.".to_string()),
+            retryable: false,
+        });
+    }
     let path = if let Some(path) = requested_path {
         if path.is_absolute() {
             path.clone()
@@ -43862,12 +43888,10 @@ fn doctor_baseline_resolve_path(
             .join("baselines")
             .join(format!("{baseline_id}.json"))
     };
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::Prefix(_)
-        )
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(CliError {
             code: 2,
             kind: "usage",
