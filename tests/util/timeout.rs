@@ -211,18 +211,9 @@ mod tests {
     use super::*;
 
     fn quick_success_command() -> Command {
-        #[cfg(windows)]
-        {
-            let mut cmd = Command::new("cmd.exe");
-            cmd.args(["/C", "echo hi"]);
-            cmd
-        }
-        #[cfg(not(windows))]
-        {
-            let mut cmd = Command::new("/bin/sh");
-            cmd.arg("-c").arg("printf 'hi' && exit 0");
-            cmd
-        }
+        let mut cmd = Command::new("rustc");
+        cmd.arg("--version");
+        cmd
     }
 
     fn long_running_command() -> Command {
@@ -251,11 +242,10 @@ mod tests {
     fn happy_path_returns_output_without_panicking() {
         let cmd = quick_success_command();
         let out = spawn_with_timeout_or_diag(cmd, "happy_path", None, Duration::from_secs(5));
-        assert!(out.status.success(), "shell must exit 0");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "hi",
-            "stdout must round-trip"
+        assert!(out.status.success(), "quick command must exit 0");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("rustc "),
+            "stdout must include rustc version"
         );
     }
 
