@@ -708,26 +708,60 @@ fn filter_by_workspace() {
 
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
-    let workspace_alpha = "/projects/workspace-alpha";
-    let workspace_beta = "/projects/workspace-beta";
+    let workspace_alpha = home
+        .join("projects")
+        .join("workspace-alpha")
+        .to_string_lossy()
+        .to_string();
+    let workspace_beta = home
+        .join("projects")
+        .join("workspace-beta")
+        .to_string_lossy()
+        .to_string();
 
     let ps = tracker.start("setup_fixtures", Some("Create workspace-specific sessions"));
     let project_a = claude_home.join("projects/project-a");
     fs::create_dir_all(&project_a).unwrap();
-    let sample_a = format!(
-        r#"{{"type": "user", "timestamp": "2024-11-20T10:00:00Z", "cwd": "{workspace_alpha}", "message": {{"role": "user", "content": "workspace_alpha workspacetest"}}}}
-{{"type": "assistant", "timestamp": "2024-11-20T10:00:05Z", "cwd": "{workspace_alpha}", "message": {{"role": "assistant", "content": "workspace_alpha_response workspacetest"}}}}"#
-    );
+    let sample_a = [
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-11-20T10:00:00Z",
+            "cwd": workspace_alpha,
+            "message": { "role": "user", "content": "workspace_alpha workspacetest" }
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-11-20T10:00:05Z",
+            "cwd": workspace_alpha,
+            "message": { "role": "assistant", "content": "workspace_alpha_response workspacetest" }
+        })
+        .to_string(),
+    ]
+    .join("\n");
     fs::write(project_a.join("session-alpha.jsonl"), sample_a).unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let project_b = claude_home.join("projects/project-b");
     fs::create_dir_all(&project_b).unwrap();
-    let sample_b = format!(
-        r#"{{"type": "user", "timestamp": "2024-11-20T11:00:00Z", "cwd": "{workspace_beta}", "message": {{"role": "user", "content": "workspace_beta workspacetest"}}}}
-{{"type": "assistant", "timestamp": "2024-11-20T11:00:05Z", "cwd": "{workspace_beta}", "message": {{"role": "assistant", "content": "workspace_beta_response workspacetest"}}}}"#
-    );
+    let sample_b = [
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-11-20T11:00:00Z",
+            "cwd": workspace_beta,
+            "message": { "role": "user", "content": "workspace_beta workspacetest" }
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-11-20T11:00:05Z",
+            "cwd": workspace_beta,
+            "message": { "role": "assistant", "content": "workspace_beta_response workspacetest" }
+        })
+        .to_string(),
+    ]
+    .join("\n");
     fs::write(project_b.join("session-beta.jsonl"), sample_b).unwrap();
     tracker.end(
         "setup_fixtures",
@@ -749,14 +783,9 @@ fn filter_by_workspace() {
         Some("Search with --workspace filter"),
     );
     let output = cargo_bin_cmd!("cass")
-        .args([
-            "search",
-            "workspacetest",
-            "--workspace",
-            workspace_alpha,
-            "--robot",
-            "--data-dir",
-        ])
+        .args(["search", "workspacetest", "--workspace"])
+        .arg(&workspace_alpha)
+        .args(["--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
         .output()
@@ -788,7 +817,8 @@ fn filter_by_workspace() {
     for hit in hits {
         let ws = hit["workspace"].as_str().unwrap_or("");
         assert_eq!(
-            ws, workspace_alpha,
+            ws,
+            workspace_alpha.as_str(),
             "Should only find content from workspace-alpha, got workspace: {}",
             ws
         );
