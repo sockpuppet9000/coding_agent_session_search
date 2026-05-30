@@ -194,6 +194,29 @@ fn assert_not_initialized_recommended_commands(json: &Value, data_dir: &Path) {
     );
 }
 
+fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path, started_at_ms: i64) -> fs::File {
+    let lock_path = data_dir.join("index-run.lock");
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    lock_file.try_lock_exclusive().expect("hold index lock");
+    let lock_metadata = format!(
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
+        std::process::id(),
+        started_at_ms,
+        db_path.display()
+    );
+    writeln!(lock_file, "{lock_metadata}").expect("write lock metadata");
+    lock_file.flush().expect("flush lock metadata");
+    fs::write(data_dir.join("index-run.lock.meta"), lock_metadata)
+        .expect("write index-run lock metadata sidecar");
+    lock_file
+}
+
 fn hold_active_lexical_rebuild_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -244,25 +267,7 @@ fn hold_active_lexical_rebuild_lock(
     )
     .expect("write rebuild state");
 
-    let lock_path = data_dir.join("index-run.lock");
-    let mut lock_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .expect("open lock file");
-    lock_file.try_lock_exclusive().expect("hold index lock");
-    writeln!(
-        lock_file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
-        std::process::id(),
-        1_733_001_444_000_i64,
-        db_path.display()
-    )
-    .expect("write lock metadata");
-    lock_file.flush().expect("flush lock metadata");
-    lock_file
+    hold_active_index_run_lock(data_dir, db_path, 1_733_001_444_000_i64)
 }
 
 #[test]
@@ -3095,7 +3100,21 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
 fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
     let db_path = data_dir.path().join("agent_search.db");
-    let _lock = hold_active_lexical_rebuild_lock(data_dir.path(), &db_path, true, None);
+    let mut index = base_cmd();
+    index.args([
+        "index",
+        "--full",
+        "--force-rebuild",
+        "--json",
+        "--no-progress-events",
+        "--data-dir",
+        data_dir.path().to_str().expect("utf8 fixture path"),
+        "--db",
+        db_path.to_str().expect("utf8 fixture db path"),
+    ]);
+    index.assert().success();
+
+    let _lock = hold_active_index_run_lock(data_dir.path(), &db_path, 1_733_001_444_000_i64);
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -3107,6 +3126,8 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<()
         "1",
         "--data-dir",
         data_dir.path().to_str().expect("utf8 fixture path"),
+        "--db",
+        db_path.to_str().expect("utf8 fixture db path"),
     ]);
 
     let assert = cmd.assert().success();
@@ -4379,30 +4400,7 @@ fn doctor_not_initialized_ignores_active_lock_for_other_db() {
     let data_dir = tmp.path();
     let db_path = data_dir.join("agent_search.db");
     let other_db_path = data_dir.join("other-agent-search.db");
-    let lock_path = data_dir.join("index-run.lock");
-
-    let mut lock_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .unwrap();
-    lock_file.try_lock_exclusive().unwrap();
-    writeln!(
-        lock_file,
-        "pid={}
-started_at_ms={}
-db_path={}
-mode=index
-job_kind=lexical_refresh
-phase=rebuilding",
-        std::process::id(),
-        1_733_001_222_000_i64,
-        other_db_path.display()
-    )
-    .unwrap();
-    lock_file.flush().unwrap();
+    let _lock_file = hold_active_index_run_lock(data_dir, &other_db_path, 1_733_001_222_000_i64);
 
     let mut cmd = base_cmd();
     cmd.args([
