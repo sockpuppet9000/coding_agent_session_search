@@ -49,10 +49,10 @@ fn make_codex_fixture(root: &Path) {
     let sessions = root.join("sessions/2025/11/21");
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join("rollout-1.jsonl");
-    let sample = r#"{"role":"user","timestamp":1700000000000,"content":"hello world test"}
-{"role":"assistant","timestamp":1700000001000,"content":"hi there from codex"}
-{"role":"user","timestamp":1700000002000,"content":"fix the authentication bug in login.rs"}
-{"role":"assistant","timestamp":1700000003000,"content":"I found the authentication issue in the login module. The session token was not being refreshed correctly."}
+    let sample = r#"{"type":"event_msg","timestamp":1700000000000,"payload":{"type":"user_message","message":"hello world test"}}
+{"type":"response_item","timestamp":1700000001000,"payload":{"role":"assistant","content":"hi there from codex"}}
+{"type":"event_msg","timestamp":1700000002000,"payload":{"type":"user_message","message":"fix the authentication bug in login.rs"}}
+{"type":"response_item","timestamp":1700000003000,"payload":{"role":"assistant","content":"I found the authentication issue in the login module. The session token was not being refreshed correctly."}}
 "#;
     fs::write(file, sample).unwrap();
 }
@@ -99,9 +99,11 @@ fn assert_search_no_panic(output: &std::process::Output) -> (bool, String, Strin
 fn setup_codex_env() -> (TempDir, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
+    let codex_home = tmp.path().join(".codex");
     fs::create_dir_all(&data_dir).unwrap();
-    make_codex_fixture(&data_dir);
-    build_full_index(tmp.path(), &data_dir, &data_dir);
+    fs::create_dir_all(&codex_home).unwrap();
+    make_codex_fixture(&codex_home);
+    build_full_index(tmp.path(), &data_dir, &codex_home);
     (tmp, data_dir)
 }
 
