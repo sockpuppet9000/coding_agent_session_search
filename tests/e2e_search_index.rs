@@ -303,6 +303,70 @@ fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
     );
 }
 
+fn output_is_retryable_index_busy(stdout: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return false;
+    };
+
+    value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|kind| kind == "index-busy")
+        && value
+            .get("retryable")
+            .and_then(|retryable| retryable.as_bool())
+            .unwrap_or(false)
+}
+
+fn run_force_rebuild_with_index_busy_retries(
+    home: &Path,
+    codex_home: &Path,
+    data_dir: &Path,
+    publish_pause_sentinel: &Path,
+    force_federated: bool,
+    expect_context: &str,
+) -> std::process::Output {
+    let retry_started = Instant::now();
+    let mut busy_attempts = 0usize;
+
+    loop {
+        let mut rebuild = cargo_bin_cmd!("cass");
+        if force_federated {
+            force_federated_publish_env(&mut rebuild);
+        }
+        let output = rebuild
+            .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+            .arg(data_dir)
+            .current_dir(home)
+            .env("CODEX_HOME", codex_home)
+            .env("HOME", home)
+            .env(
+                "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
+                publish_pause_sentinel,
+            )
+            .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
+            .timeout(Duration::from_secs(60))
+            .output()
+            .expect(expect_context);
+
+        if !output.status.success()
+            && output_is_retryable_index_busy(&output.stdout)
+            && retry_started.elapsed() < Duration::from_secs(10)
+        {
+            busy_attempts += 1;
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        if busy_attempts > 0 {
+            eprintln!(
+                "retried force rebuild after {busy_attempts} retryable index-busy response(s)"
+            );
+        }
+        return output;
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn cass_std_cmd(home: &Path, codex_home: &Path) -> StdCommand {
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -1112,20 +1176,14 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     );
     rebuild_running.store(true, Ordering::Relaxed);
     let publish_pause_sentinel = home.join("atomic-publish-overlap-sentinel.json");
-    let rebuild_output = cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .env(
-            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
-            &publish_pause_sentinel,
-        )
-        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
-        .timeout(Duration::from_secs(60))
-        .output()
-        .expect("run force rebuild under concurrent read/search load");
+    let rebuild_output = run_force_rebuild_with_index_busy_retries(
+        &home,
+        &codex_home,
+        &data_dir,
+        &publish_pause_sentinel,
+        false,
+        "run force rebuild under concurrent read/search load",
+    );
     rebuild_running.store(false, Ordering::Relaxed);
     let rebuild_duration_ms = rebuild_start.elapsed().as_millis() as u64;
     tracker.end(
@@ -1456,23 +1514,15 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         Some("Run cass index --full --force-rebuild with forced multi-shard planning while a direct reader and cass search poll the same live index"),
     );
     rebuild_running.store(true, Ordering::Relaxed);
-    let mut rebuild = cargo_bin_cmd!("cass");
-    force_federated_publish_env(&mut rebuild);
     let publish_pause_sentinel = home.join("federated-atomic-publish-overlap-sentinel.json");
-    let rebuild_output = rebuild
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .env(
-            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
-            &publish_pause_sentinel,
-        )
-        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
-        .timeout(Duration::from_secs(60))
-        .output()
-        .expect("run federated force rebuild under concurrent read/search load");
+    let rebuild_output = run_force_rebuild_with_index_busy_retries(
+        &home,
+        &codex_home,
+        &data_dir,
+        &publish_pause_sentinel,
+        true,
+        "run federated force rebuild under concurrent read/search load",
+    );
     rebuild_running.store(false, Ordering::Relaxed);
     let rebuild_duration_ms = rebuild_start.elapsed().as_millis() as u64;
     tracker.end(

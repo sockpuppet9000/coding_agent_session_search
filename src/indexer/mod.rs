@@ -15307,7 +15307,7 @@ fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<
 
 #[cfg(windows)]
 fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
-    const MAX_ATTEMPTS: usize = 50;
+    const MAX_ATTEMPTS: usize = 500;
     const SLEEP_MS: u64 = 20;
 
     for attempt in 0..MAX_ATTEMPTS {

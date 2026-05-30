@@ -1075,6 +1075,16 @@ fn tui_pty_detail_modal_shows_markdown_content() {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after markdown query submission in PTY flow"
     );
+    let saw_markdown_result =
+        wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+            let rendered_lower = rendered.to_ascii_lowercase();
+            rendered_lower.contains("show markdown sentinel sample")
+                || rendered_lower.contains("markdown sentinel alpha")
+        });
+    assert!(
+        saw_markdown_result,
+        "Did not observe markdown fixture search result before detail-open attempt"
+    );
     thread::sleep(Duration::from_millis(200));
 
     let before_open_len = captured.lock().expect("capture lock").len();
@@ -1128,6 +1138,7 @@ fn tui_pty_detail_modal_shows_markdown_content() {
         "test": "tui_pty_detail_modal_shows_markdown_content",
         "saw_detail_growth": saw_detail_growth,
         "saw_detail": saw_detail,
+        "saw_markdown_result": saw_markdown_result,
         "first_esc_exited": first_esc_exited,
         "total_esc_presses_to_exit": 1 + additional_esc_presses,
         "saw_heading": saw_heading,
