@@ -55,7 +55,8 @@
     },
     "daemon": {
       "exit_codes": [
-        9
+        9,
+        15
       ]
     },
     "db-error": {
