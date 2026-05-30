@@ -3,7 +3,7 @@ use coding_agent_search::connectors::{
     Connector, NormalizedConversation, NormalizedMessage, ScanContext,
 };
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,14 +165,49 @@ fn assert_message_contracts(conversation: &NormalizedConversation) {
     }
 }
 
+fn expected_external_id(file_name: &str) -> PathBuf {
+    ["projects", "org", "team", file_name].iter().collect()
+}
+
+fn external_id_matches_path(external_id: &str, expected: &Path) -> bool {
+    PathBuf::from(external_id).as_path() == expected
+}
+
+fn is_fixture_external_id(external_id: &str) -> bool {
+    let external_id = PathBuf::from(external_id);
+    let components = external_id
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+
+    matches!(
+        components.as_slice(),
+        [projects, org, team, file_name]
+            if projects == "projects"
+                && org == "org"
+                && team == "team"
+                && file_name.ends_with(".jsonl")
+    )
+}
+
 fn conversation_by_external_id<'a>(
     conversations: &'a [NormalizedConversation],
-    external_id: &str,
+    external_id: &Path,
 ) -> &'a NormalizedConversation {
     conversations
         .iter()
-        .find(|conversation| conversation.external_id.as_deref() == Some(external_id))
-        .unwrap_or_else(|| panic!("missing conversation with external_id {external_id}"))
+        .find(|conversation| {
+            conversation
+                .external_id
+                .as_deref()
+                .is_some_and(|id| external_id_matches_path(id, external_id))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing conversation with external_id {}",
+                external_id.display()
+            )
+        })
 }
 
 #[test]
@@ -213,7 +248,7 @@ fn claude_code_connector_output_conforms_to_normalized_contract() {
             conversation
                 .external_id
                 .as_deref()
-                .is_some_and(|id| id.starts_with("projects/org/team/") && id.ends_with(".jsonl")),
+                .is_some_and(is_fixture_external_id),
             "{} {}",
             source_requirement.id,
             source_requirement.description
@@ -243,7 +278,7 @@ fn claude_code_connector_output_conforms_to_normalized_contract() {
         );
     }
 
-    let alpha = conversation_by_external_id(&conversations, "projects/org/team/alpha.jsonl");
+    let alpha = conversation_by_external_id(&conversations, &expected_external_id("alpha.jsonl"));
     assert_eq!(alpha.messages.len(), 3);
     assert!(
         alpha
