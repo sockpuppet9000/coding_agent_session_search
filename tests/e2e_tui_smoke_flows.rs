@@ -970,15 +970,29 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after spaced query submission in PTY Enter flow"
     );
+    let saw_fixture_result_before_detail =
+        wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+            rendered_contains_hello_fixture_content(rendered)
+        });
+    assert!(
+        saw_fixture_result_before_detail,
+        "Did not observe fixture search result before spaced-query detail-open attempt"
+    );
     thread::sleep(Duration::from_millis(180));
 
     let before_open_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"\r");
-    let saw_detail = wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail_growth =
+        wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail = wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+        rendered_contains_detail_messages_marker(rendered)
+            && rendered_contains_hello_fixture_content(rendered)
+    });
     assert!(
         saw_detail,
-        "Did not observe output growth after Enter detail-open attempt for spaced query"
+        "Did not observe detail modal content after Enter detail-open attempt for spaced query"
     );
+    thread::sleep(Duration::from_millis(220));
 
     send_key_sequence(&mut *writer, b"\x1b");
     thread::sleep(Duration::from_millis(220));
@@ -1008,7 +1022,9 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
     let summary = serde_json::json!({
         "trace_id": trace,
         "test": "tui_pty_search_query_with_space_opens_detail_modal",
-        "saw_detail_growth": saw_detail,
+        "saw_fixture_result_before_detail": saw_fixture_result_before_detail,
+        "saw_detail_growth": saw_detail_growth,
+        "saw_detail": saw_detail,
         "first_esc_exited": first_esc_exited,
         "total_esc_presses_to_exit": 1 + additional_esc_presses,
         "saw_messages_detail": saw_messages_detail,
