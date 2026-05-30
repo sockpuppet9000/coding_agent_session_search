@@ -15307,7 +15307,10 @@ fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<
 
 #[cfg(windows)]
 fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
-    const MAX_ATTEMPTS: usize = 500;
+    // Windows refuses directory renames while readers, AV scanners, or indexers
+    // hold child handles; a publish should wait out short-lived handles but still
+    // report a retryable error when the path remains blocked.
+    const MAX_ATTEMPTS: usize = 1_500;
     const SLEEP_MS: u64 = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
