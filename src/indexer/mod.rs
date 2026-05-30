@@ -15352,10 +15352,10 @@ fn windows_lexical_publish_rename_is_transient(err: &std::io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
 fn maybe_pause_lexical_publish_for_kill_relaunch(
     index_path: &Path,
     canonical_sidecar: &Path,
+    stage: &'static str,
 ) -> Result<()> {
     let sentinel_path = match dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL") {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
@@ -15367,7 +15367,7 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
         .filter(|value| *value > 0)
         .unwrap_or(30_000);
     let payload = serde_json::json!({
-        "stage": "linux_swap_committed_prior_live_parked",
+        "stage": stage,
         "pid": std::process::id(),
         "live_index_path": index_path.display().to_string(),
         "canonical_sidecar_path": canonical_sidecar.display().to_string(),
@@ -15502,13 +15502,17 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
             }
         }
 
-        maybe_pause_lexical_publish_for_kill_relaunch(index_path, &canonical_sidecar)
-            .with_context(|| {
-                format!(
-                    "pausing lexical publish after parking prior live generation at {}",
-                    canonical_sidecar.display()
-                )
-            })?;
+        maybe_pause_lexical_publish_for_kill_relaunch(
+            index_path,
+            &canonical_sidecar,
+            "linux_swap_committed_prior_live_parked",
+        )
+        .with_context(|| {
+            format!(
+                "pausing lexical publish after parking prior live generation at {}",
+                canonical_sidecar.display()
+            )
+        })?;
 
         // B: move canonical sidecar into `.lexical-publish-backups/` under
         // a unique dated name. Failure here is recoverable without rollback:
@@ -15620,6 +15624,17 @@ fn publish_via_rename_pair(
             }
         }
     }
+    maybe_pause_lexical_publish_for_kill_relaunch(
+        index_path,
+        &in_progress_backup_path,
+        "rename_pair_publish_committed_prior_live_parked",
+    )
+    .with_context(|| {
+        format!(
+            "pausing lexical publish after parking prior live generation at {}",
+            in_progress_backup_path.display()
+        )
+    })?;
     if let Err(retain_err) = rename_lexical_publish_path(
         &in_progress_backup_path,
         retained_backup_path,
