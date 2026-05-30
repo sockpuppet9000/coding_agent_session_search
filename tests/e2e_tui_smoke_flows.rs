@@ -922,6 +922,12 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
         wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT),
         "Did not observe startup output before spaced-query detail flow interaction"
     );
+    assert!(
+        wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |rendered| {
+            rendered.contains("Search sessions, messages")
+        }),
+        "Did not observe rendered search input before spaced-query detail flow interaction"
+    );
 
     // Regression contract: literal spaces must remain editable in the query field.
     send_key_sequence(&mut *writer, b"hello world");
@@ -932,14 +938,26 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after spaced query submission in PTY Enter flow"
     );
+    assert!(
+        wait_for_rendered_output(&captured, Duration::from_secs(6), |rendered| {
+            let rendered = rendered.to_ascii_lowercase();
+            rendered.contains("hello world") || rendered.contains("hi there, how can")
+        }),
+        "Did not observe fixture search result before spaced query detail-open attempt"
+    );
     thread::sleep(Duration::from_millis(180));
 
     let before_open_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"\r");
-    let saw_detail = wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail_growth =
+        wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail = wait_for_rendered_output(&captured, Duration::from_secs(6), |rendered| {
+        rendered_contains_detail_messages_marker(rendered)
+    });
     assert!(
         saw_detail,
-        "Did not observe output growth after Enter detail-open attempt for spaced query"
+        "Did not observe detail marker after Enter detail-open attempt for spaced query \
+         (output_growth={saw_detail_growth})"
     );
 
     send_key_sequence(&mut *writer, b"\x1b");
@@ -971,6 +989,7 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
         "trace_id": trace,
         "test": "tui_pty_search_query_with_space_opens_detail_modal",
         "saw_detail_growth": saw_detail,
+        "saw_detail_output_growth": saw_detail_growth,
         "first_esc_exited": first_esc_exited,
         "total_esc_presses_to_exit": 1 + additional_esc_presses,
         "saw_messages_detail": saw_messages_detail,
