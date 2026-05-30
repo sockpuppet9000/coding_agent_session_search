@@ -702,12 +702,12 @@ fn filter_by_workspace() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let claude_home = home.join(".claude");
+    let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_claude = EnvGuard::set("CLAUDE_CONFIG_DIR", claude_home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     let workspace_alpha_path = home.join("projects").join("workspace-alpha");
     let workspace_beta_path = home.join("projects").join("workspace-beta");
@@ -718,49 +718,56 @@ fn filter_by_workspace() {
     fs::create_dir_all(&workspace_alpha_path).unwrap();
     fs::create_dir_all(&workspace_beta_path).unwrap();
 
-    let project_a = claude_home.join("projects/project-a");
-    fs::create_dir_all(&project_a).unwrap();
+    let sessions = codex_home.join("sessions/2024/11/20");
+    fs::create_dir_all(&sessions).unwrap();
+
     let sample_a = [
         serde_json::json!({
-            "type": "user",
+            "type": "session_meta",
             "timestamp": "2024-11-20T10:00:00Z",
-            "cwd": workspace_alpha,
-            "message": { "role": "user", "content": "workspace_alpha workspacetest" }
+            "payload": { "id": "workspace-alpha-session", "cwd": workspace_alpha }
         })
         .to_string(),
         serde_json::json!({
-            "type": "assistant",
+            "type": "event_msg",
+            "timestamp": "2024-11-20T10:00:01Z",
+            "payload": { "type": "user_message", "message": "workspace_alpha workspacetest" }
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "response_item",
             "timestamp": "2024-11-20T10:00:05Z",
-            "cwd": workspace_alpha,
-            "message": { "role": "assistant", "content": "workspace_alpha_response workspacetest" }
+            "payload": { "role": "assistant", "content": "workspace_alpha_response workspacetest" }
         })
         .to_string(),
     ]
     .join("\n");
-    fs::write(project_a.join("session-alpha.jsonl"), sample_a).unwrap();
+    fs::write(sessions.join("rollout-alpha.jsonl"), sample_a).unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let project_b = claude_home.join("projects/project-b");
-    fs::create_dir_all(&project_b).unwrap();
     let sample_b = [
         serde_json::json!({
-            "type": "user",
+            "type": "session_meta",
             "timestamp": "2024-11-20T11:00:00Z",
-            "cwd": workspace_beta,
-            "message": { "role": "user", "content": "workspace_beta workspacetest" }
+            "payload": { "id": "workspace-beta-session", "cwd": workspace_beta }
         })
         .to_string(),
         serde_json::json!({
-            "type": "assistant",
+            "type": "event_msg",
+            "timestamp": "2024-11-20T11:00:01Z",
+            "payload": { "type": "user_message", "message": "workspace_beta workspacetest" }
+        })
+        .to_string(),
+        serde_json::json!({
+            "type": "response_item",
             "timestamp": "2024-11-20T11:00:05Z",
-            "cwd": workspace_beta,
-            "message": { "role": "assistant", "content": "workspace_beta_response workspacetest" }
+            "payload": { "role": "assistant", "content": "workspace_beta_response workspacetest" }
         })
         .to_string(),
     ]
     .join("\n");
-    fs::write(project_b.join("session-beta.jsonl"), sample_b).unwrap();
+    fs::write(sessions.join("rollout-beta.jsonl"), sample_b).unwrap();
     tracker.end(
         "setup_fixtures",
         Some("Create workspace-specific sessions"),
@@ -772,7 +779,7 @@ fn filter_by_workspace() {
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
-        .env("CLAUDE_CONFIG_DIR", &claude_home)
+        .env("CODEX_HOME", &codex_home)
         .assert()
         .success();
     tracker.end("run_index", Some("Run full index"), ps);
@@ -787,7 +794,7 @@ fn filter_by_workspace() {
         .args(["--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
-        .env("CLAUDE_CONFIG_DIR", &claude_home)
+        .env("CODEX_HOME", &codex_home)
         .output()
         .expect("search command");
     let filter_duration = ps.elapsed().as_millis() as u64;
