@@ -5263,14 +5263,15 @@ fn normalize_flag_case() {
 
 /// Subcommand aliases should work: find → search
 #[test]
-fn subcommand_alias_find_to_search() {
+fn subcommand_alias_find_to_search() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let mut cmd = base_cmd();
     cmd.args([
         "find",
         "test query",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
     ]);
     // 'find' should be normalized to 'search'
     // May succeed or fail based on search results, but should not fail on parsing
@@ -5278,6 +5279,7 @@ fn subcommand_alias_find_to_search() {
     // If command is recognized, it should either succeed or fail with a search-related error
     // not a "command not found" error
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
+    Ok(())
 }
 
 /// Subcommand alias: query → search
@@ -6125,16 +6127,18 @@ fn introspect_matches_golden_contract_structure() {
 
 /// Exit code 0: Success for valid search
 #[test]
-fn exit_code_0_success_search() {
+fn exit_code_0_success_search() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
     let mut cmd = base_cmd();
     cmd.args([
         "search",
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
     ]);
     cmd.assert().code(0);
+    Ok(())
 }
 
 /// Exit code 0: Success for valid stats
