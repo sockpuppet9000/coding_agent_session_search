@@ -188,7 +188,6 @@ pub struct DoctorE2eFileEntry {
     pub modified_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blake3: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub hash_error: Option<String>,
 }
 
