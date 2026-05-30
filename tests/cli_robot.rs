@@ -2024,7 +2024,8 @@ fn search_cursor_and_token_budget() {
 
 #[test]
 fn search_cursor_jsonl_and_compact() {
-    let data_dir = "tests/fixtures/search_demo_data";
+    let fixture = isolated_search_demo_data().expect("copy search demo fixture");
+    let data_dir = fixture.path().to_str().expect("temp fixture path is utf-8");
     // JSONL meta line contains next_cursor
     let mut cmd = base_cmd();
     cmd.args([
