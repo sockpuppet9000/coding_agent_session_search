@@ -22,6 +22,12 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 # [target.aarch64-apple-darwin] - uses default linker
 # [target.x86_64-apple-darwin] - uses default linker
 
+[target.x86_64-pc-windows-msvc]
+# Windows PE executables default to a 1 MiB main-thread stack. The indexing
+# binary can exceed that in debug/test builds before worker-thread stack
+# sizing applies, so reserve the same 16 MiB stack used by coverage runs.
+rustflags = ["-C", "link-arg=/STACK:16777216"]
+
 # Alias for coverage command
 [alias]
 cov = "llvm-cov --workspace --ignore-filename-regex tests/ --ignore-filename-regex benches/"
