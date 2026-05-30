@@ -88,15 +88,22 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
         .open(&lock_path)
         .expect("open lock file");
     lock_file.lock_exclusive().expect("hold index lock");
-    writeln!(
-        lock_file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+    let lock_metadata = format!(
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
         std::process::id(),
         1_733_000_111_000_i64,
         db_path.display()
-    )
-    .expect("write lock metadata");
+    );
+    lock_file
+        .write_all(lock_metadata.as_bytes())
+        .expect("write lock metadata");
     lock_file.flush().expect("flush lock metadata");
+    lock_file.sync_all().expect("sync lock metadata");
+    fs::write(
+        lock_path.with_file_name("index-run.lock.meta"),
+        lock_metadata.as_bytes(),
+    )
+    .expect("write lock metadata sidecar");
     lock_file
 }
 

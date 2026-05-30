@@ -193,7 +193,7 @@ fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<
 
 #[cfg(windows)]
 pub(crate) fn windows_lock_conflict(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(32 | 33))
+    matches!(err.raw_os_error(), Some(5 | 32 | 33))
 }
 
 #[cfg(not(windows))]
@@ -2196,6 +2196,16 @@ mod tests {
         let snapshot2 = read_search_maintenance_snapshot(temp.path());
         assert!(!snapshot2.active);
         assert!(!snapshot2.orphaned);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_conflict_treats_access_denied_as_active_lock() {
+        // Windows can report a held lock-file handle as ERROR_ACCESS_DENIED
+        // when the reader opens the file, before fs2 can return the more
+        // specific lock violation codes from try_lock_exclusive.
+        let err = std::io::Error::from_raw_os_error(5);
+        assert!(windows_lock_conflict(&err));
     }
 
     #[test]
