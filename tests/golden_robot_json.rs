@@ -324,7 +324,7 @@ fn normalize_live_robot_values(value: &mut Value) {
             {
                 if let Some(Value::Object(topology)) = map.get_mut("topology") {
                     if let Some(source) = topology.get_mut("source") {
-                        *source = json!("linux_sysfs");
+                        *source = json!("[TOPOLOGY_SOURCE]");
                     }
                     for key in ["memory_total_bytes", "memory_available_bytes"] {
                         if let Some(child) = topology.get_mut(key) {
@@ -336,30 +336,20 @@ fn normalize_live_robot_values(value: &mut Value) {
                     map.get_mut("reserved_core_policy")
                 {
                     if let Some(policy) = reserved_core_policy.get_mut("policy") {
-                        *policy = json!(
-                            "max(default, locality*2_on_large_hosts, smt_width, logical/12) capped at 16"
-                        );
+                        *policy = json!("[TOPOLOGY_POLICY]");
                     }
                     if let Some(reason) = reserved_core_policy.get_mut("reason") {
-                        *reason = json!(
-                            "reserve 16 of 128 logical CPUs for interactive work, IO, and NUMA/LLC service headroom"
-                        );
+                        *reason = json!("[TOPOLOGY_REASON]");
                     }
                 }
                 if let Some(fallback_active) = map.get_mut("fallback_active") {
-                    *fallback_active = json!(false);
+                    *fallback_active = json!("[TOPOLOGY_FALLBACK_ACTIVE]");
                 }
                 if let Some(decision_reason) = map.get_mut("decision_reason") {
-                    *decision_reason = json!(
-                        "planned from ManyCoreSingleSocket: 128 logical CPUs, 64 physical cores, 1 socket(s), 1 NUMA node(s), 8 LLC group(s)"
-                    );
+                    *decision_reason = json!("[TOPOLOGY_DECISION_REASON]");
                 }
                 if let Some(proof_notes) = map.get_mut("proof_notes") {
-                    *proof_notes = json!([
-                        "advisory only: live controllers keep current conservative settings until explicitly wired",
-                        "CPU budgets prefer physical cores and LLC/NUMA locality over SMT oversubscription",
-                        "RAM caps scale only when MemAvailable is large enough to preserve broad host headroom"
-                    ]);
+                    *proof_notes = json!(["[TOPOLOGY_PROOF_NOTES]"]);
                 }
             }
 
@@ -622,66 +612,6 @@ fn live_value_scrubbing_normalizes_runtime_objects_with_type_fields() {
     assert_eq!(
         scrubbed["runtime"]["advisory_budgets"]["semantic_batchers"],
         8
-    );
-}
-
-#[test]
-fn live_value_scrubbing_normalizes_topology_budget_fallbacks() {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let input = serde_json::to_string_pretty(&json!({
-        "topology_budget": {
-            "schema_version": "1",
-            "topology": {
-                "source": "fallback",
-                "topology_class": "single_socket",
-                "logical_cpus": 8,
-                "physical_cores": 8,
-                "sockets": 1,
-                "numa_nodes": 1,
-                "llc_groups": 1,
-                "smt_threads_per_core": 1,
-                "memory_total_bytes": null,
-                "memory_available_bytes": null
-            },
-            "reserved_core_policy": {
-                "reserved_cores": 2,
-                "policy": "current conservative default",
-                "reason": "topology could not be derived"
-            },
-            "advisory_budgets": {
-                "semantic_batchers": 1
-            },
-            "fallback_active": true,
-            "decision_reason": "using conservative defaults",
-            "proof_notes": [
-                "fallback is intentionally isomorphic to current defaults"
-            ]
-        }
-    }))
-    .expect("serialize fixture");
-
-    let scrubbed = scrub_robot_json(&input, test_home.path());
-    let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
-
-    assert_eq!(
-        scrubbed["topology_budget"]["topology"]["source"],
-        "linux_sysfs"
-    );
-    assert_eq!(
-        scrubbed["topology_budget"]["topology"]["memory_total_bytes"],
-        "[LIVE_BYTES]"
-    );
-    assert_eq!(
-        scrubbed["topology_budget"]["reserved_core_policy"]["policy"],
-        "max(default, locality*2_on_large_hosts, smt_width, logical/12) capped at 16"
-    );
-    assert_eq!(scrubbed["topology_budget"]["fallback_active"], false);
-    assert_eq!(
-        scrubbed["topology_budget"]["proof_notes"]
-            .as_array()
-            .expect("proof notes array")
-            .len(),
-        3
     );
 }
 
