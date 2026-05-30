@@ -24925,6 +24925,9 @@ fn build_doctor_safe_auto_run_report(
         }
 
         let data_risk = doctor_data_loss_risk_rank(check.data_loss_risk);
+        if !check.fix_available && !check.fix_applied && action == "manual_doctor_review" {
+            continue;
+        }
         let decision = if check.safe_for_auto_repair
             && input.operation_state.mutating_doctor_allowed
             && input.db_ok
