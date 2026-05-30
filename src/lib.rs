@@ -72596,6 +72596,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "rebuilding": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
@@ -72731,6 +72732,9 @@ fn response_schema_rebuild_state() -> serde_json::Value {
         "type": "object",
         "properties": {
             "active": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
+            "last_progress_at": { "type": ["string", "null"] },
+            "last_progress_age_ms": { "type": ["integer", "null"] },
             "orphaned": { "type": "boolean" },
             "pid": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
@@ -72808,6 +72812,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
             "feature_compiled_in": { "type": "boolean" },
+            "quality_tier_published": { "type": "boolean" },
+            "semantic_only_search_available": { "type": "boolean" },
             "hint": { "type": ["string", "null"] },
             "fast_tier": {
                 "type": "object",

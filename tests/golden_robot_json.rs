@@ -335,18 +335,6 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
 
                 match key.as_str() {
-                    "platform" => {
-                        if let Some(platform) = child.as_object_mut()
-                            && platform.get("os").is_some_and(serde_json::Value::is_string)
-                            && platform
-                                .get("arch")
-                                .is_some_and(serde_json::Value::is_string)
-                        {
-                            platform.insert("os".to_string(), json!("[OS]"));
-                            platform.insert("arch".to_string(), json!("[ARCH]"));
-                            continue;
-                        }
-                    }
                     "current_capacity_pct" => {
                         *child = json!(100);
                         continue;
@@ -586,11 +574,7 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
             "agent": "codex",
             "snippet": "historical private snippet",
             "content": "historical private content"
-        }],
-        "platform": {
-            "os": "linux",
-            "arch": "x86_64"
-        }
+        }]
     }))
     .expect("serialize fixture");
 
@@ -611,8 +595,6 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
     assert_eq!(scrubbed["results"][1]["workspace"], "[REPO]");
     assert_eq!(scrubbed["results"][1]["snippet"], "[RESULT_SNIPPET]");
     assert_eq!(scrubbed["results"][1]["content"], "[RESULT_CONTENT]");
-    assert_eq!(scrubbed["platform"]["os"], "[OS]");
-    assert_eq!(scrubbed["platform"]["arch"], "[ARCH]");
     assert!(
         !serde_json::to_string(&scrubbed)
             .expect("serialize scrubbed fixture")
@@ -663,6 +645,16 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         out = out.replace(repo_root, "[REPO]");
     }
     out = out.replace("/data/projects/coding_agent_session_search", "[REPO]");
+
+    let live_platform = format!(
+        "\"platform\": {{\n    \"os\": \"{}\",\n    \"arch\": \"{}\"\n  }}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    out = out.replace(
+        &live_platform,
+        "\"platform\": {\n    \"os\": \"[OS]\",\n    \"arch\": \"[ARCH]\"\n  }",
+    );
 
     // 4. UUIDs.
     let uuid_re =
