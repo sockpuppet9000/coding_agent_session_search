@@ -30255,42 +30255,15 @@ fn doctor_config_exclusion_targets(
 }
 
 fn doctor_path_to_slash_string(path: &Path) -> String {
-    let mut rendered = String::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => {
-                if !rendered.is_empty() && !rendered.ends_with('/') {
-                    rendered.push('/');
-                }
-                for ch in prefix.as_os_str().to_string_lossy().chars() {
-                    rendered.push(if ch == '\\' { '/' } else { ch });
-                }
-            }
-            std::path::Component::RootDir => {
-                if !rendered.ends_with('/') {
-                    rendered.push('/');
-                }
-            }
-            std::path::Component::CurDir => {
-                if rendered.is_empty() {
-                    rendered.push('.');
-                }
-            }
-            std::path::Component::ParentDir => {
-                if !rendered.is_empty() && !rendered.ends_with('/') {
-                    rendered.push('/');
-                }
-                rendered.push_str("..");
-            }
-            std::path::Component::Normal(part) => {
-                if !rendered.is_empty() && !rendered.ends_with('/') {
-                    rendered.push('/');
-                }
-                rendered.push_str(&part.to_string_lossy());
-            }
-        }
-    }
-    rendered
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            std::path::Component::RootDir => Some("/".into()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+        .replace("//", "/")
 }
 
 fn doctor_pattern_matches_relative_path(raw_pattern: &str, relative_path: &Path) -> bool {
@@ -34371,13 +34344,12 @@ fn doctor_archive_normalize_apply_argv(
     plan_fingerprint: &str,
 ) -> Vec<String> {
     let mut argv = vec!["cass".to_string()];
-    let data_dir_identity = doctor_path_identity_for_fingerprint(data_dir);
     let db_path_identity = doctor_path_identity_for_fingerprint(db_path);
     let default_db_identity =
         doctor_path_identity_for_fingerprint(&data_dir.join("agent_search.db"));
     if db_path_identity != default_db_identity {
         argv.push("--db".to_string());
-        argv.push(db_path_identity);
+        argv.push(doctor_path_argument_for_apply_argv(db_path));
     }
     argv.extend([
         "doctor".to_string(),
@@ -34390,8 +34362,12 @@ fn doctor_archive_normalize_apply_argv(
         argv.push("--json".to_string());
     }
     argv.push("--data-dir".to_string());
-    argv.push(data_dir_identity);
+    argv.push(doctor_path_argument_for_apply_argv(data_dir));
     argv
+}
+
+fn doctor_path_argument_for_apply_argv(path: &Path) -> String {
+    normalize_path_identity(path).display().to_string()
 }
 
 fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
