@@ -188,6 +188,8 @@ pub struct DoctorE2eFileEntry {
     pub modified_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blake3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1828,10 +1830,13 @@ impl DoctorE2eFileTreeSnapshot {
                     } else {
                         "other"
                     };
-                    let blake3 = if metadata.is_file() {
-                        Some(file_blake3(path)?)
+                    let (blake3, hash_error) = if metadata.is_file() {
+                        match file_blake3_io(path) {
+                            Ok(hash) => (Some(hash), None),
+                            Err(err) => (None, Some(file_hash_error_code(&err))),
+                        }
                     } else {
-                        None
+                        (None, None)
                     };
                     entries.push(DoctorE2eFileEntry {
                         relative_path,
@@ -1839,6 +1844,7 @@ impl DoctorE2eFileTreeSnapshot {
                         size_bytes: metadata.len(),
                         modified_unix_ms: metadata_modified_unix_ms(&metadata),
                         blake3,
+                        hash_error,
                     });
                 }
             }
@@ -4694,10 +4700,21 @@ fn write_file_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn file_blake3(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    file_blake3_io(path).map_err(|err| format!("hash {}: {err}", path.display()))
+}
+
+fn file_blake3_io(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    io::copy(&mut file, &mut hasher).map_err(|err| format!("hash {}: {err}", path.display()))?;
+    io::copy(&mut file, &mut hasher)?;
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn file_hash_error_code(err: &io::Error) -> String {
+    match err.raw_os_error() {
+        Some(code) => format!("hash-unavailable:{:?}:{code}", err.kind()),
+        None => format!("hash-unavailable:{:?}", err.kind()),
+    }
 }
 
 fn redact_json_value(value: Value, redactor: &DoctorE2eRedactor) -> Value {
