@@ -9,6 +9,10 @@ fn codex_real_fixture_home() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_real")
 }
 
+fn external_id_as_slash(id: Option<&str>) -> Option<String> {
+    id.map(|value| value.replace('\\', "/"))
+}
+
 #[test]
 #[serial]
 fn codex_connector_reads_modern_envelope_jsonl() {
@@ -157,7 +161,7 @@ fn codex_connector_parses_real_tool_call_fixture() {
     assert_eq!(conv.agent_slug, "codex");
     assert_eq!(conv.workspace, Some(PathBuf::from("/test/soldier/project")));
     assert_eq!(
-        conv.external_id,
+        external_id_as_slash(conv.external_id.as_deref()),
         Some("2025/11/26/rollout-tool-call".to_string())
     );
     assert_eq!(
@@ -735,7 +739,7 @@ fn codex_connector_sets_external_id_from_filename() {
     let c = &convs[0];
     // external_id is now the relative path from sessions dir for uniqueness across directories
     assert_eq!(
-        c.external_id,
+        external_id_as_slash(c.external_id.as_deref()),
         Some("2025/12/02/rollout-unique-id-123".to_string())
     );
 }
@@ -912,7 +916,7 @@ fn codex_connector_ignores_non_rollout_files() {
     assert_eq!(convs.len(), 1);
     // external_id is now the relative path from sessions dir for uniqueness across directories
     assert_eq!(
-        convs[0].external_id,
+        external_id_as_slash(convs[0].external_id.as_deref()),
         Some("2025/12/06/rollout-valid".to_string())
     );
 }
