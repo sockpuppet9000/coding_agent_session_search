@@ -245,6 +245,12 @@ fn hold_active_lexical_rebuild_lock(
     .expect("write rebuild state");
 
     let lock_path = data_dir.join("index-run.lock");
+    let lock_metadata = format!(
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding\n",
+        std::process::id(),
+        1_733_001_444_000_i64,
+        db_path.display()
+    );
     let mut lock_file = fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -253,15 +259,11 @@ fn hold_active_lexical_rebuild_lock(
         .open(&lock_path)
         .expect("open lock file");
     lock_file.try_lock_exclusive().expect("hold index lock");
-    writeln!(
-        lock_file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
-        std::process::id(),
-        1_733_001_444_000_i64,
-        db_path.display()
-    )
-    .expect("write lock metadata");
+    lock_file
+        .write_all(lock_metadata.as_bytes())
+        .expect("write lock metadata");
     lock_file.flush().expect("flush lock metadata");
+    fs::write(data_dir.join("index-run.lock.meta"), lock_metadata).expect("write lock sidecar");
     lock_file
 }
 
@@ -2675,7 +2677,9 @@ fn search_no_match_returns_empty_hits() {
 fn search_writes_trace_on_success() {
     // E2E test: trace file captures successful search (yln.5)
     let tmp = TempDir::new().unwrap();
+    let fixture = isolated_search_demo_data().unwrap();
     let trace_path = tmp.path().join("search_trace.jsonl");
+    let data_dir = fixture.path().to_str().unwrap();
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -2685,7 +2689,7 @@ fn search_writes_trace_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        data_dir,
     ]);
 
     cmd.assert().success();
@@ -4380,6 +4384,18 @@ fn doctor_not_initialized_ignores_active_lock_for_other_db() {
     let db_path = data_dir.join("agent_search.db");
     let other_db_path = data_dir.join("other-agent-search.db");
     let lock_path = data_dir.join("index-run.lock");
+    let lock_metadata = format!(
+        "pid={}
+started_at_ms={}
+db_path={}
+mode=index
+job_kind=lexical_refresh
+phase=rebuilding
+",
+        std::process::id(),
+        1_733_001_222_000_i64,
+        other_db_path.display()
+    );
 
     let mut lock_file = fs::OpenOptions::new()
         .create(true)
@@ -4389,20 +4405,9 @@ fn doctor_not_initialized_ignores_active_lock_for_other_db() {
         .open(&lock_path)
         .unwrap();
     lock_file.try_lock_exclusive().unwrap();
-    writeln!(
-        lock_file,
-        "pid={}
-started_at_ms={}
-db_path={}
-mode=index
-job_kind=lexical_refresh
-phase=rebuilding",
-        std::process::id(),
-        1_733_001_222_000_i64,
-        other_db_path.display()
-    )
-    .unwrap();
+    lock_file.write_all(lock_metadata.as_bytes()).unwrap();
     lock_file.flush().unwrap();
+    fs::write(data_dir.join("index-run.lock.meta"), lock_metadata).unwrap();
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -4505,6 +4510,18 @@ fn search_missing_index_reports_current_rebuild_in_progress() {
     let data_dir = tmp.path();
     let db_path = data_dir.join("agent_search.db");
     let lock_path = data_dir.join("index-run.lock");
+    let lock_metadata = format!(
+        "pid={}
+started_at_ms={}
+db_path={}
+mode=index
+job_kind=lexical_refresh
+phase=rebuilding
+",
+        std::process::id(),
+        1_733_001_333_000_i64,
+        db_path.display()
+    );
 
     let mut lock_file = fs::OpenOptions::new()
         .create(true)
@@ -4514,20 +4531,9 @@ fn search_missing_index_reports_current_rebuild_in_progress() {
         .open(&lock_path)
         .unwrap();
     lock_file.try_lock_exclusive().unwrap();
-    writeln!(
-        lock_file,
-        "pid={}
-started_at_ms={}
-db_path={}
-mode=index
-job_kind=lexical_refresh
-phase=rebuilding",
-        std::process::id(),
-        1_733_001_333_000_i64,
-        db_path.display()
-    )
-    .unwrap();
+    lock_file.write_all(lock_metadata.as_bytes()).unwrap();
     lock_file.flush().unwrap();
+    fs::write(data_dir.join("index-run.lock.meta"), lock_metadata).unwrap();
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -6117,14 +6123,10 @@ fn introspect_matches_golden_contract_structure() {
 /// Exit code 0: Success for valid search
 #[test]
 fn exit_code_0_success_search() {
+    let fixture = isolated_search_demo_data().unwrap();
+    let data_dir = fixture.path().to_str().unwrap();
     let mut cmd = base_cmd();
-    cmd.args([
-        "search",
-        "hello",
-        "--json",
-        "--data-dir",
-        "tests/fixtures/search_demo_data",
-    ]);
+    cmd.args(["search", "hello", "--json", "--data-dir", data_dir]);
     cmd.assert().code(0);
 }
 

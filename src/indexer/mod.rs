@@ -7477,10 +7477,11 @@ fn lexical_rebuild_content_fingerprint(
 }
 
 fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
-    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let db_identity = crate::normalize_path_identity(db_path);
+    let mut storage = FrankenStorage::open_readonly(&db_identity).with_context(|| {
         format!(
             "opening readonly storage to compute lexical fingerprint for {}",
-            db_path.display()
+            db_identity.display()
         )
     })?;
     let total_conversations = count_total_conversations_exact(&storage)?;
@@ -12267,6 +12268,17 @@ pub fn run_index(
                             t_index = Some(TantivyIndex::open_or_create(&index_path)?);
                         }
                     }
+                }
+
+                if !scan_canonical_mutations.changed()
+                    && let Some((exact_total_conversations, exact_total_messages)) =
+                        initial_matching_lexical_checkpoint.completed_exact_totals
+                {
+                    record_exact_total_counts_in_progress(
+                        opts.progress.as_ref(),
+                        exact_total_conversations,
+                        exact_total_messages,
+                    );
                 }
             }
         }

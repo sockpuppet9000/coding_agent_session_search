@@ -199,14 +199,18 @@ fn consecutive_indexes_produce_stable_conversation_and_message_totals() -> TestR
         format!(
             "conversation counts drifted across consecutive idempotent runs: \
              first={conv1}, second={conv2}. Either the planner is double-counting \
-             or the source is being re-discovered as new on every run."
+             or the source is being re-discovered as new on every run.\n\
+             first envelope: {envelope1}\n\
+             second envelope: {envelope2}"
         ),
     )?;
     ensure(
         matches!(msg1.cmp(&msg2), Ordering::Equal),
         format!(
-            "message counts drifted across consecutive idempotent runs: \
-             first={msg1}, second={msg2}."
+            "message counts drifted across consecutive idempotent runs: first={msg1}, \
+             second={msg2}.\n\
+             first envelope: {envelope1}\n\
+             second envelope: {envelope2}"
         ),
     )?;
     Ok(())
