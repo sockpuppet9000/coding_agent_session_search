@@ -1529,21 +1529,43 @@ mod tests {
                 }
             };
 
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-            let mut buf = [0u8; 4096];
-            match stream.read(&mut buf) {
-                Ok(_) => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
-                    ) => {}
-                Err(_) => return,
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut request_bytes = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request_bytes.extend_from_slice(&buf[..read]);
+                        if request_bytes
+                            .windows(b"\r\n\r\n".len())
+                            .any(|window| window == b"\r\n\r\n")
+                        {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
+                        ) =>
+                    {
+                        if request_bytes.is_empty() {
+                            return;
+                        }
+                        break;
+                    }
+                    Err(_) => return,
+                }
             }
 
-            if stream.write_all(response.as_bytes()).is_ok() {
-                let _ = stream.flush();
-                let _ = stream.shutdown(Shutdown::Both);
+            match stream.write_all(response.as_bytes()) {
+                Ok(()) => {
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(Shutdown::Write);
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(_) => {}
             }
         });
 
