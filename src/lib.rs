@@ -24790,26 +24790,30 @@ fn doctor_check_report(
     }
 }
 
-fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str {
+fn doctor_safe_auto_named_action_for_check(check: &DoctorCheckReport) -> Option<&'static str> {
     match check.name.as_str() {
-        "data_directory" => "create_missing_cass_data_dir",
-        "lock_file" => "remove_stale_legacy_index_lock",
+        "data_directory" => Some("create_missing_cass_data_dir"),
+        "lock_file" => Some("remove_stale_legacy_index_lock"),
         "index" | "index_sync" | "fts_table" | "rebuild" => {
-            "rebuild_derived_lexical_index_from_archive_db"
+            Some("rebuild_derived_lexical_index_from_archive_db")
         }
-        "semantic_model" => "report_lexical_fallback_without_model_download",
-        "raw_mirror_backfill" => "backfill_additive_raw_mirror_metadata",
-        "candidate_staging" => "build_isolated_reconstruct_candidate",
-        "safe_auto_archive_rebuild" => "archive_rebuild_from_sources",
-        "database" => "archive_database_repair",
-        "database_backup" => "archive_database_bundle_move_or_backup",
-        "source_coverage" => "source_coverage_repair",
-        "source_inventory" => "source_authority_repair",
-        "repair_failure_marker" => "repeat_repair",
-        "operation_state" => "mutating_doctor_repair",
-        "derivative_cleanup" => "derived_cleanup",
-        _ => "manual_doctor_review",
+        "semantic_model" => Some("report_lexical_fallback_without_model_download"),
+        "raw_mirror_backfill" => Some("backfill_additive_raw_mirror_metadata"),
+        "candidate_staging" => Some("build_isolated_reconstruct_candidate"),
+        "safe_auto_archive_rebuild" => Some("archive_rebuild_from_sources"),
+        "database" => Some("archive_database_repair"),
+        "database_backup" => Some("archive_database_bundle_move_or_backup"),
+        "source_coverage" => Some("source_coverage_repair"),
+        "source_inventory" => Some("source_authority_repair"),
+        "repair_failure_marker" => Some("repeat_repair"),
+        "operation_state" => Some("mutating_doctor_repair"),
+        "derivative_cleanup" => Some("derived_cleanup"),
+        _ => None,
     }
+}
+
+fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str {
+    doctor_safe_auto_named_action_for_check(check).unwrap_or("manual_doctor_review")
 }
 
 fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static str {
@@ -24925,7 +24929,10 @@ fn build_doctor_safe_auto_run_report(
         }
 
         let data_risk = doctor_data_loss_risk_rank(check.data_loss_risk);
-        if !check.fix_available && !check.fix_applied && action == "manual_doctor_review" {
+        if !check.fix_available
+            && !check.fix_applied
+            && doctor_safe_auto_named_action_for_check(check).is_none()
+        {
             continue;
         }
         let decision = if check.safe_for_auto_repair
