@@ -1294,7 +1294,6 @@ pub enum Commands {
     Analytics(AnalyticsCommand),
 
     /// Run the semantic model daemon (Unix only)
-    #[cfg(unix)]
     Daemon {
         /// Socket path to listen on (default comes from env or built-in config)
         #[arg(long)]
@@ -6799,7 +6798,6 @@ async fn execute_cli(
                 Commands::Analytics(subcmd) => {
                     run_analytics(subcmd, cli.db.clone(), cli)?;
                 }
-                #[cfg(unix)]
                 Commands::Daemon {
                     socket,
                     idle_timeout,
@@ -7281,7 +7279,6 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
-                #[cfg(unix)]
                 Commands::Daemon {
                     socket,
                     idle_timeout,
@@ -17209,7 +17206,6 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Models(..)) => "models".to_string(),
         Some(Commands::Swarm(..)) => "swarm".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
-        #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
@@ -90879,6 +90875,26 @@ fn run_daemon(
         kind: CliErrorKind::Daemon.kind_str(),
         message: format!("Daemon failed: {e}"),
         hint: None,
+        retryable: false,
+    })
+}
+
+/// Run the semantic model daemon (Unix only)
+#[cfg(not(unix))]
+fn run_daemon(
+    _socket: Option<PathBuf>,
+    _idle_timeout: Option<u64>,
+    _max_connections: Option<usize>,
+    _data_dir: Option<PathBuf>,
+) -> CliResult<()> {
+    Err(CliError {
+        code: 15,
+        kind: CliErrorKind::Daemon.kind_str(),
+        message: "The semantic model daemon is only supported on Unix platforms".to_string(),
+        hint: Some(
+            "On this platform, run semantic search without --daemon or use lexical fallback."
+                .to_string(),
+        ),
         retryable: false,
     })
 }
