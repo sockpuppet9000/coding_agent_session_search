@@ -34292,13 +34292,12 @@ fn doctor_archive_normalize_apply_argv(
     plan_fingerprint: &str,
 ) -> Vec<String> {
     let mut argv = vec!["cass".to_string()];
-    let data_dir_identity = doctor_path_identity_for_fingerprint(data_dir);
     let db_path_identity = doctor_path_identity_for_fingerprint(db_path);
     let default_db_identity =
         doctor_path_identity_for_fingerprint(&data_dir.join("agent_search.db"));
     if db_path_identity != default_db_identity {
         argv.push("--db".to_string());
-        argv.push(db_path_identity);
+        argv.push(doctor_path_for_exact_argv(db_path));
     }
     argv.extend([
         "doctor".to_string(),
@@ -34311,12 +34310,12 @@ fn doctor_archive_normalize_apply_argv(
         argv.push("--json".to_string());
     }
     argv.push("--data-dir".to_string());
-    argv.push(data_dir_identity);
+    argv.push(doctor_path_for_exact_argv(data_dir));
     argv
 }
 
-fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
-    let identity_path = match std::fs::canonicalize(path) {
+fn doctor_resolved_path_for_identity(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
         Ok(canonical) => canonical,
         Err(_) => path
             .parent()
@@ -34328,8 +34327,17 @@ fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
                 })
             })
             .unwrap_or_else(|| path.to_path_buf()),
-    };
-    doctor_path_to_slash_string(&identity_path)
+    }
+}
+
+fn doctor_path_for_exact_argv(path: &Path) -> String {
+    doctor_resolved_path_for_identity(path)
+        .display()
+        .to_string()
+}
+
+fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
+    doctor_path_to_slash_string(&doctor_resolved_path_for_identity(path))
 }
 
 fn doctor_archive_normalize_root_binding(data_dir: &Path, db_path: &Path) -> serde_json::Value {
@@ -40163,6 +40171,20 @@ fn doctor_archive_export_target_artifact_safety(
     }
 }
 
+fn doctor_archive_export_transient_db_lock_sidecar(
+    relative: &str,
+    expected_paths: &BTreeSet<String>,
+) -> bool {
+    const TRANSIENT_LOCK_SUFFIXES: &[&str] = &["-lock-shared", "-lock-reserved", "-lock-pending"];
+
+    expected_paths.iter().any(|expected| {
+        expected.ends_with(".db")
+            && relative
+                .strip_prefix(expected)
+                .is_some_and(|suffix| TRANSIENT_LOCK_SUFFIXES.contains(&suffix))
+    })
+}
+
 fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> serde_json::Value {
     let manifest_path = doctor_archive_export_manifest_path(target_root);
     if let Ok(metadata) = std::fs::symlink_metadata(target_root)
@@ -40318,6 +40340,9 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
                 continue;
             }
             if !expected_paths.contains(&relative) {
+                if doctor_archive_export_transient_db_lock_sidecar(&relative, &expected_paths) {
+                    continue;
+                }
                 issues.push(serde_json::json!({
                     "kind": "extra_file",
                     "path": relative,
@@ -43814,12 +43839,10 @@ fn doctor_baseline_resolve_path(
             .join("baselines")
             .join(format!("{baseline_id}.json"))
     };
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::Prefix(_)
-        )
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(CliError {
             code: 2,
             kind: "usage",
