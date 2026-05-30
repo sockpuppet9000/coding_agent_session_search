@@ -30255,7 +30255,42 @@ fn doctor_config_exclusion_targets(
 }
 
 fn doctor_path_to_slash_string(path: &Path) -> String {
-    path.as_os_str().to_string_lossy().replace('\\', "/")
+    let mut rendered = String::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                if !rendered.is_empty() && !rendered.ends_with('/') {
+                    rendered.push('/');
+                }
+                for ch in prefix.as_os_str().to_string_lossy().chars() {
+                    rendered.push(if ch == '\\' { '/' } else { ch });
+                }
+            }
+            std::path::Component::RootDir => {
+                if !rendered.ends_with('/') {
+                    rendered.push('/');
+                }
+            }
+            std::path::Component::CurDir => {
+                if rendered.is_empty() {
+                    rendered.push('.');
+                }
+            }
+            std::path::Component::ParentDir => {
+                if !rendered.is_empty() && !rendered.ends_with('/') {
+                    rendered.push('/');
+                }
+                rendered.push_str("..");
+            }
+            std::path::Component::Normal(part) => {
+                if !rendered.is_empty() && !rendered.ends_with('/') {
+                    rendered.push('/');
+                }
+                rendered.push_str(&part.to_string_lossy());
+            }
+        }
+    }
+    rendered
 }
 
 fn doctor_pattern_matches_relative_path(raw_pattern: &str, relative_path: &Path) -> bool {
