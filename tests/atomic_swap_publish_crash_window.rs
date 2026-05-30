@@ -291,6 +291,7 @@ fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish
         before_federated_readers.len() > 1,
         "forced shard planner settings should materialize a federated live index before rebuild"
     );
+    drop(before_federated_readers);
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);
