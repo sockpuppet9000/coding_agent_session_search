@@ -16415,6 +16415,12 @@ fn refresh_state_database_counts_if_needed(
     );
 }
 
+fn status_should_collect_inline_doctor_coverage(db_path: &Path) -> bool {
+    std::fs::metadata(db_path)
+        .map(|metadata| metadata.is_file() && metadata.len() <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
+        .unwrap_or(false)
+}
+
 fn readiness_snapshot_from_state(
     state: &serde_json::Value,
     not_initialized: bool,
@@ -64724,11 +64730,7 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        // Commit fe3972dc deliberately dropped status_should_skip_db_open and
-        // its STATUS_COUNT_SCAN_MAX_DB_BYTES short-circuit; the policy is now
-        // "always probe via DB open" — see the commit message. This call site
-        // was missed in that cleanup; inlining the now-unconditional `true`.
-        let status_collects_coverage = db_exists;
+        let status_collects_coverage = status_should_collect_inline_doctor_coverage(&db_path);
         let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
             (
                 collect_doctor_coverage_risk_summary(&data_dir, &db_path),
@@ -66165,6 +66167,38 @@ mod cli_read_db_tests {
             database
                 .get("messages")
                 .is_some_and(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn status_inline_doctor_coverage_only_runs_for_small_regular_db() {
+        let (temp, small_db_path) = seed_cli_db();
+        assert!(
+            status_should_collect_inline_doctor_coverage(&small_db_path),
+            "small regular archive DBs keep checked status coverage"
+        );
+
+        let missing_db_path = temp.path().join("missing-agent-search.db");
+        assert!(
+            !status_should_collect_inline_doctor_coverage(&missing_db_path),
+            "missing DBs cannot run inline coverage"
+        );
+
+        let directory_db_path = temp.path().join("db-directory");
+        std::fs::create_dir_all(&directory_db_path).expect("create db directory placeholder");
+        assert!(
+            !status_should_collect_inline_doctor_coverage(&directory_db_path),
+            "malformed directory DB paths must not run inline coverage"
+        );
+
+        let large_db_path = temp.path().join("large-agent-search.db");
+        let file = std::fs::File::create(&large_db_path).expect("create sparse large db");
+        file.set_len(STATUS_COUNT_SCAN_MAX_DB_BYTES + 4096)
+            .expect("grow sparse large db");
+        drop(file);
+        assert!(
+            !status_should_collect_inline_doctor_coverage(&large_db_path),
+            "large archives stay on the fast status path and leave coverage to doctor"
         );
     }
 

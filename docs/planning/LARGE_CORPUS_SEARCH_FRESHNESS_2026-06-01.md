@@ -87,10 +87,27 @@ Live read-only verification with the explicit rebuilt binary showed:
   search surface's 1800 second freshness threshold.
 - The canonical DB row is still old until a deliberate maintenance/index run:
   `last_indexed_at=1780097891493`, `last_scan_ts=1780089414052`.
-- `cass status --json` did not return within roughly 90s and was terminated;
-  `cass health` also reported an existing Doctor repair lock. That status /
-  Doctor-summary path is a separate follow-up, not this freshness reconciliation
-  fix.
+
+2026-06-01 status follow-up:
+
+- `cass health --json` no longer reports an active Doctor repair owner for the
+  old empty lock file: `doctor_summary.active_repair.active=false`.
+- `cass status --json` previously still did not return within roughly 50s on
+  the live large archive. The slow path was not DB counts; `counts_skipped=true`
+  was already pinned. The remaining expensive work was the structured status
+  payload's inline Doctor coverage collection, which scanned archive/source/raw
+  mirror state intended for `cass doctor --json`.
+- `cass status --json` now keeps checked inline coverage only for small regular
+  archive DBs. Large or malformed DB paths use the fast coverage summary
+  (`coverage_risk.status=unchecked_fast_health`,
+  `doctor_summary.coverage_source.source=status-fast-state`) and point operators
+  at `cass doctor --json` for the expensive ledger.
+- Live read-only verification with the explicit rebuilt binary against
+  `/Users/seitz/Library/Application Support/com.coding-agent-search.coding-agent-search`
+  returned in about 1.4s. The payload reported `status=unhealthy` only because
+  the lexical index was older than the 300s status threshold; coverage was
+  deliberately `unchecked`, remote archive sync was not archive-checked, and DB
+  counts remained skipped.
 
 `rch` was not available in this local environment, so the broad compile check
 was run locally instead of via remote compute.
@@ -102,10 +119,9 @@ was run locally instead of via remote compute.
 - Re-run `cass health --json` and `cass search --robot-meta` against the same
   explicit binary and data dir; their `last_indexed_at`/checkpoint view should
   converge.
-- Diagnose the slow `cass status --json` / Doctor repair-lock path. The local
-  `doctor/locks/doctor-repair.lock` file exists from 2026-05-30, no active
-  `cass` process was observed during the follow-up check, and no cleanup was
-  performed in this work block.
+- If exact source/raw-mirror/archive coverage is needed on the large corpus, use
+  `cass doctor --json`; `cass status --json` intentionally stays a fast
+  readiness surface.
 - Re-test the target ChatGPT import corpus
   `019e6f57-0e03-75a3-acda-338c6de08aaa` and distinguish weak rollout-reference
   hits from actual imported ChatGPT conversation hits.
