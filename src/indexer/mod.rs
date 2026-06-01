@@ -9921,7 +9921,29 @@ const STREAMING_MAX_BYTES_IN_FLIGHT: usize =
 #[derive(Debug)]
 struct StreamingByteLimiterState {
     bytes_in_flight: usize,
+    sender_pending_bytes: usize,
+    channel_pending_bytes: usize,
+    consumer_active_bytes: usize,
+    untracked_bytes: usize,
     closed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamingByteLimiterSnapshot {
+    bytes_in_flight: usize,
+    max_bytes_in_flight: usize,
+    sender_pending_bytes: usize,
+    channel_pending_bytes: usize,
+    consumer_active_bytes: usize,
+    untracked_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamingByteReservationOwner {
+    SenderPending,
+    ChannelPending,
+    ConsumerActive,
+    Untracked,
 }
 
 #[derive(Debug)]
@@ -9938,18 +9960,42 @@ impl StreamingByteLimiter {
             max_bytes_in_flight: AtomicUsize::new(max_bytes_in_flight.max(1)),
             state: Mutex::new(StreamingByteLimiterState {
                 bytes_in_flight: 0,
+                sender_pending_bytes: 0,
+                channel_pending_bytes: 0,
+                consumer_active_bytes: 0,
+                untracked_bytes: 0,
                 closed: false,
             }),
             cv: Condvar::new(),
         }
     }
 
+    #[cfg(test)]
     fn acquire(&self, requested_bytes: usize) -> Result<usize> {
-        self.acquire_with_wait(requested_bytes)
+        self.acquire_with_wait_for_owner(requested_bytes, StreamingByteReservationOwner::Untracked)
             .map(|(reservation, _, _)| reservation)
     }
 
-    fn try_acquire(&self, requested_bytes: usize) -> Result<Option<usize>> {
+    fn acquire_sender_pending(&self, requested_bytes: usize) -> Result<usize> {
+        self.acquire_with_wait_for_owner(
+            requested_bytes,
+            StreamingByteReservationOwner::SenderPending,
+        )
+        .map(|(reservation, _, _)| reservation)
+    }
+
+    fn try_acquire_sender_pending(&self, requested_bytes: usize) -> Result<Option<usize>> {
+        self.try_acquire_with_owner(
+            requested_bytes,
+            StreamingByteReservationOwner::SenderPending,
+        )
+    }
+
+    fn try_acquire_with_owner(
+        &self,
+        requested_bytes: usize,
+        owner: StreamingByteReservationOwner,
+    ) -> Result<Option<usize>> {
         if requested_bytes == 0 {
             return Ok(Some(0));
         }
@@ -9965,6 +10011,7 @@ impl StreamingByteLimiter {
         let reservation = requested_bytes.min(max_bytes_in_flight);
         if state.bytes_in_flight.saturating_add(reservation) <= max_bytes_in_flight {
             state.bytes_in_flight += reservation;
+            Self::add_owner_bytes(&mut state, owner, reservation);
             Ok(Some(reservation))
         } else {
             Ok(None)
@@ -9972,6 +10019,14 @@ impl StreamingByteLimiter {
     }
 
     fn acquire_with_wait(&self, requested_bytes: usize) -> Result<(usize, Duration, bool)> {
+        self.acquire_with_wait_for_owner(requested_bytes, StreamingByteReservationOwner::Untracked)
+    }
+
+    fn acquire_with_wait_for_owner(
+        &self,
+        requested_bytes: usize,
+        owner: StreamingByteReservationOwner,
+    ) -> Result<(usize, Duration, bool)> {
         if requested_bytes == 0 {
             return Ok((0, Duration::ZERO, false));
         }
@@ -9990,6 +10045,7 @@ impl StreamingByteLimiter {
             let reservation = requested_bytes.min(max_bytes_in_flight);
             if state.bytes_in_flight.saturating_add(reservation) <= max_bytes_in_flight {
                 state.bytes_in_flight += reservation;
+                Self::add_owner_bytes(&mut state, owner, reservation);
                 let wait_duration = if waited {
                     wait_started.elapsed()
                 } else {
@@ -10004,13 +10060,60 @@ impl StreamingByteLimiter {
     }
 
     fn release(&self, reserved_bytes: usize) {
+        self.release_from_owner(reserved_bytes, StreamingByteReservationOwner::Untracked);
+    }
+
+    fn release_sender_pending(&self, reserved_bytes: usize) {
+        self.release_from_owner(reserved_bytes, StreamingByteReservationOwner::SenderPending);
+    }
+
+    fn release_channel_pending(&self, reserved_bytes: usize) {
+        self.release_from_owner(
+            reserved_bytes,
+            StreamingByteReservationOwner::ChannelPending,
+        );
+    }
+
+    fn release_consumer_active(&self, reserved_bytes: usize) {
+        self.release_from_owner(
+            reserved_bytes,
+            StreamingByteReservationOwner::ConsumerActive,
+        );
+    }
+
+    fn release_from_owner(&self, reserved_bytes: usize, owner: StreamingByteReservationOwner) {
         if reserved_bytes == 0 {
             return;
         }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.bytes_in_flight = state.bytes_in_flight.saturating_sub(reserved_bytes);
+        let release_bytes = reserved_bytes.min(state.bytes_in_flight);
+        let remaining = Self::subtract_owner_bytes(&mut state, owner, release_bytes);
+        Self::subtract_any_owner_bytes(&mut state, remaining);
+        state.bytes_in_flight = state.bytes_in_flight.saturating_sub(release_bytes);
         self.cv.notify_all();
+    }
+
+    fn move_sender_pending_to_channel(&self, reserved_bytes: usize) {
+        if reserved_bytes == 0 {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let moved = reserved_bytes.min(state.sender_pending_bytes);
+        state.sender_pending_bytes -= moved;
+        state.channel_pending_bytes = state.channel_pending_bytes.saturating_add(moved);
+    }
+
+    fn move_channel_pending_to_consumer(&self, reserved_bytes: usize) {
+        if reserved_bytes == 0 {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let moved = reserved_bytes.min(state.channel_pending_bytes);
+        state.channel_pending_bytes -= moved;
+        state.consumer_active_bytes = state.consumer_active_bytes.saturating_add(moved);
     }
 
     fn bytes_in_flight(&self) -> usize {
@@ -10020,14 +10123,17 @@ impl StreamingByteLimiter {
             .bytes_in_flight
     }
 
-    fn snapshot(&self) -> (usize, usize) {
-        let bytes_in_flight = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .bytes_in_flight;
+    fn snapshot(&self) -> StreamingByteLimiterSnapshot {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let max_bytes_in_flight = self.max_bytes_in_flight.load(Ordering::Acquire);
-        (bytes_in_flight, max_bytes_in_flight)
+        StreamingByteLimiterSnapshot {
+            bytes_in_flight: state.bytes_in_flight,
+            max_bytes_in_flight,
+            sender_pending_bytes: state.sender_pending_bytes,
+            channel_pending_bytes: state.channel_pending_bytes,
+            consumer_active_bytes: state.consumer_active_bytes,
+            untracked_bytes: state.untracked_bytes,
+        }
     }
 
     fn update_max_bytes_in_flight(&self, max_bytes_in_flight: usize) {
@@ -10065,6 +10171,76 @@ impl StreamingByteLimiter {
         state.closed = true;
         self.cv.notify_all();
     }
+
+    fn add_owner_bytes(
+        state: &mut StreamingByteLimiterState,
+        owner: StreamingByteReservationOwner,
+        bytes: usize,
+    ) {
+        match owner {
+            StreamingByteReservationOwner::SenderPending => {
+                state.sender_pending_bytes = state.sender_pending_bytes.saturating_add(bytes);
+            }
+            StreamingByteReservationOwner::ChannelPending => {
+                state.channel_pending_bytes = state.channel_pending_bytes.saturating_add(bytes);
+            }
+            StreamingByteReservationOwner::ConsumerActive => {
+                state.consumer_active_bytes = state.consumer_active_bytes.saturating_add(bytes);
+            }
+            StreamingByteReservationOwner::Untracked => {
+                state.untracked_bytes = state.untracked_bytes.saturating_add(bytes);
+            }
+        }
+    }
+
+    fn subtract_owner_bytes(
+        state: &mut StreamingByteLimiterState,
+        owner: StreamingByteReservationOwner,
+        bytes: usize,
+    ) -> usize {
+        match owner {
+            StreamingByteReservationOwner::SenderPending => {
+                Self::subtract_counter_bytes(&mut state.sender_pending_bytes, bytes)
+            }
+            StreamingByteReservationOwner::ChannelPending => {
+                Self::subtract_counter_bytes(&mut state.channel_pending_bytes, bytes)
+            }
+            StreamingByteReservationOwner::ConsumerActive => {
+                Self::subtract_counter_bytes(&mut state.consumer_active_bytes, bytes)
+            }
+            StreamingByteReservationOwner::Untracked => {
+                Self::subtract_counter_bytes(&mut state.untracked_bytes, bytes)
+            }
+        }
+    }
+
+    fn subtract_any_owner_bytes(state: &mut StreamingByteLimiterState, mut bytes: usize) {
+        bytes = Self::subtract_counter_bytes(&mut state.untracked_bytes, bytes);
+        bytes = Self::subtract_counter_bytes(&mut state.consumer_active_bytes, bytes);
+        bytes = Self::subtract_counter_bytes(&mut state.channel_pending_bytes, bytes);
+        let _remaining = Self::subtract_counter_bytes(&mut state.sender_pending_bytes, bytes);
+    }
+
+    fn subtract_counter_bytes(counter: &mut usize, bytes: usize) -> usize {
+        let subtracted = (*counter).min(bytes);
+        *counter -= subtracted;
+        bytes - subtracted
+    }
+}
+
+fn streaming_byte_limiter_stage(
+    stage_prefix: &str,
+    snapshot: StreamingByteLimiterSnapshot,
+) -> String {
+    format!(
+        "{stage_prefix}_inflight_{}_max_{}_sender_{}_channel_{}_consumer_{}_untracked_{}",
+        snapshot.bytes_in_flight,
+        snapshot.max_bytes_in_flight,
+        snapshot.sender_pending_bytes,
+        snapshot.channel_pending_bytes,
+        snapshot.consumer_active_bytes,
+        snapshot.untracked_bytes
+    )
 }
 
 #[derive(Debug)]
@@ -10239,7 +10415,7 @@ impl<'a> StreamingBatchSender<'a> {
         }
 
         record_current_connector_scan_detail_stage("streaming_batch_acquire_start");
-        let byte_reservation = match self.flow_limiter.try_acquire(char_count) {
+        let byte_reservation = match self.flow_limiter.try_acquire_sender_pending(char_count) {
             Ok(Some(byte_reservation)) => byte_reservation,
             Ok(None) if !self.conversations.is_empty() => {
                 record_current_connector_scan_detail_stage(
@@ -10249,26 +10425,35 @@ impl<'a> StreamingBatchSender<'a> {
                 record_current_connector_scan_detail_stage(
                     "streaming_batch_acquire_pending_flush_done",
                 );
-                let (bytes_in_flight, max_bytes_in_flight) = self.flow_limiter.snapshot();
-                record_current_connector_scan_detail_stage_string(format!(
-                    "streaming_batch_acquire_waiting_after_pending_flush_request_{char_count}_inflight_{bytes_in_flight}_max_{max_bytes_in_flight}"
+                let stage_prefix = format!(
+                    "streaming_batch_acquire_waiting_after_pending_flush_request_{char_count}"
+                );
+                record_current_connector_scan_detail_stage_string(streaming_byte_limiter_stage(
+                    &stage_prefix,
+                    self.flow_limiter.snapshot(),
                 ));
-                self.flow_limiter.acquire(char_count).map_err(|_| {
-                    anyhow::Error::new(StreamingConsumerDisconnected {
-                        connector_name: self.connector_name,
-                    })
-                })?
+                self.flow_limiter
+                    .acquire_sender_pending(char_count)
+                    .map_err(|_| {
+                        anyhow::Error::new(StreamingConsumerDisconnected {
+                            connector_name: self.connector_name,
+                        })
+                    })?
             }
             Ok(None) => {
-                let (bytes_in_flight, max_bytes_in_flight) = self.flow_limiter.snapshot();
-                record_current_connector_scan_detail_stage_string(format!(
-                    "streaming_batch_acquire_waiting_empty_pending_request_{char_count}_inflight_{bytes_in_flight}_max_{max_bytes_in_flight}"
+                let stage_prefix =
+                    format!("streaming_batch_acquire_waiting_empty_pending_request_{char_count}");
+                record_current_connector_scan_detail_stage_string(streaming_byte_limiter_stage(
+                    &stage_prefix,
+                    self.flow_limiter.snapshot(),
                 ));
-                self.flow_limiter.acquire(char_count).map_err(|_| {
-                    anyhow::Error::new(StreamingConsumerDisconnected {
-                        connector_name: self.connector_name,
-                    })
-                })?
+                self.flow_limiter
+                    .acquire_sender_pending(char_count)
+                    .map_err(|_| {
+                        anyhow::Error::new(StreamingConsumerDisconnected {
+                            connector_name: self.connector_name,
+                        })
+                    })?
             }
             Err(_) => {
                 return Err(anyhow::Error::new(StreamingConsumerDisconnected {
@@ -10297,7 +10482,8 @@ impl<'a> StreamingBatchSender<'a> {
     fn flush(&mut self) -> Result<()> {
         if self.conversations.is_empty() {
             if self.byte_reservation > 0 {
-                self.flow_limiter.release(self.byte_reservation);
+                self.flow_limiter
+                    .release_sender_pending(self.byte_reservation);
                 self.byte_reservation = 0;
             }
             return Ok(());
@@ -10307,6 +10493,8 @@ impl<'a> StreamingBatchSender<'a> {
         let byte_reservation = self.byte_reservation;
         let conversations = std::mem::take(&mut self.conversations);
         record_current_connector_scan_detail_stage("streaming_batch_send_start");
+        self.flow_limiter
+            .move_sender_pending_to_channel(byte_reservation);
         if let Err(_send_error) = self.tx.send(IndexMessage::Batch {
             connector_name: self.connector_name,
             conversations,
@@ -10315,7 +10503,7 @@ impl<'a> StreamingBatchSender<'a> {
             byte_reservation,
         }) {
             record_current_connector_scan_detail_stage("streaming_batch_send_error");
-            self.flow_limiter.release(byte_reservation);
+            self.flow_limiter.release_channel_pending(byte_reservation);
             self.message_count = 0;
             self.char_count = 0;
             self.byte_reservation = 0;
@@ -10335,7 +10523,8 @@ impl<'a> StreamingBatchSender<'a> {
 impl Drop for StreamingBatchSender<'_> {
     fn drop(&mut self) {
         if self.byte_reservation > 0 {
-            self.flow_limiter.release(self.byte_reservation);
+            self.flow_limiter
+                .release_sender_pending(self.byte_reservation);
             self.byte_reservation = 0;
         }
     }
@@ -11210,9 +11399,7 @@ fn run_streaming_consumer(
     };
     let record_consumer_limiter_stage = |stage_prefix: &str| {
         if consumer_stage_telemetry_enabled {
-            let (bytes_in_flight, max_bytes_in_flight) = flow_limiter.snapshot();
-            let stage =
-                format!("{stage_prefix}_inflight_{bytes_in_flight}_max_{max_bytes_in_flight}");
+            let stage = streaming_byte_limiter_stage(stage_prefix, flow_limiter.snapshot());
             record_consumer_stage(&stage);
         }
     };
@@ -11237,6 +11424,7 @@ fn run_streaming_consumer(
                 message_count,
                 byte_reservation,
             }) => {
+                flow_limiter.move_channel_pending_to_consumer(byte_reservation);
                 record_consumer_stage("consumer_batch_received");
                 // Accumulators start with the first-received batch.
                 let mut combined_conversations: Vec<NormalizedConversation> = conversations;
@@ -11300,6 +11488,8 @@ fn run_streaming_consumer(
                                 message_count: extra_msg_count,
                                 byte_reservation: extra_byte_reservation,
                             }) => {
+                                flow_limiter
+                                    .move_channel_pending_to_consumer(extra_byte_reservation);
                                 let extra_size = extra_convs.len();
                                 // Per-connector stats for the extra batch.
                                 let stats = connector_stats
@@ -11358,13 +11548,13 @@ fn run_streaming_consumer(
                     Err(error) => {
                         record_consumer_limiter_stage("consumer_ingest_error");
                         record_consumer_limiter_stage("consumer_release_start");
-                        flow_limiter.release(combined_byte_reservation);
+                        flow_limiter.release_consumer_active(combined_byte_reservation);
                         record_consumer_limiter_stage("consumer_release_done");
                         return Err(error);
                     }
                 };
                 record_consumer_limiter_stage("consumer_release_start");
-                flow_limiter.release(combined_byte_reservation);
+                flow_limiter.release_consumer_active(combined_byte_reservation);
                 record_consumer_limiter_stage("consumer_release_done");
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome);
 
@@ -33368,12 +33558,20 @@ mod tests {
             expected_bytes,
             "producer-side pending batches must be counted before flush"
         );
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.sender_pending_bytes, expected_bytes);
+        assert_eq!(snapshot.channel_pending_bytes, 0);
+        assert_eq!(snapshot.consumer_active_bytes, 0);
         assert!(
             rx.try_recv().is_err(),
             "non-oversized conversation should remain pending until flush"
         );
 
         sender.flush().unwrap();
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.sender_pending_bytes, 0);
+        assert_eq!(snapshot.channel_pending_bytes, expected_bytes);
+        assert_eq!(snapshot.consumer_active_bytes, 0);
         match rx.try_recv().expect("flush should publish pending batch") {
             IndexMessage::Batch {
                 connector_name,
@@ -33388,7 +33586,11 @@ mod tests {
                 assert_eq!(message_count, 1);
                 assert_eq!(byte_reservation, expected_bytes);
                 assert_eq!(limiter.bytes_in_flight(), expected_bytes);
-                limiter.release(byte_reservation);
+                limiter.move_channel_pending_to_consumer(byte_reservation);
+                let snapshot = limiter.snapshot();
+                assert_eq!(snapshot.channel_pending_bytes, 0);
+                assert_eq!(snapshot.consumer_active_bytes, expected_bytes);
+                limiter.release_consumer_active(byte_reservation);
             }
             other => panic!(
                 "expected batch for pending conversation flush, got {:?}",
@@ -33396,6 +33598,60 @@ mod tests {
             ),
         }
         assert_eq!(limiter.bytes_in_flight(), 0);
+    }
+
+    #[test]
+    fn streaming_batch_sender_tracks_reservation_ownership_lifecycle() {
+        let (tx, rx) = bounded(1);
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "codex", true);
+        let expected_bytes = 768;
+
+        sender
+            .push(norm_conv(
+                Some("owned"),
+                vec![NormalizedMessage {
+                    content: "x".repeat(expected_bytes),
+                    ..norm_msg(0, 1_000)
+                }],
+            ))
+            .expect("conversation should reserve pending sender bytes");
+
+        let pending = limiter.snapshot();
+        assert_eq!(pending.bytes_in_flight, expected_bytes);
+        assert_eq!(pending.sender_pending_bytes, expected_bytes);
+        assert_eq!(pending.channel_pending_bytes, 0);
+        assert_eq!(pending.consumer_active_bytes, 0);
+
+        sender.flush().expect("flush should publish the batch");
+        let queued = limiter.snapshot();
+        assert_eq!(queued.bytes_in_flight, expected_bytes);
+        assert_eq!(queued.sender_pending_bytes, 0);
+        assert_eq!(queued.channel_pending_bytes, expected_bytes);
+        assert_eq!(queued.consumer_active_bytes, 0);
+
+        let IndexMessage::Batch {
+            byte_reservation, ..
+        } = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued batch")
+        else {
+            panic!("expected queued streaming batch");
+        };
+        limiter.move_channel_pending_to_consumer(byte_reservation);
+        let active = limiter.snapshot();
+        assert_eq!(active.bytes_in_flight, expected_bytes);
+        assert_eq!(active.sender_pending_bytes, 0);
+        assert_eq!(active.channel_pending_bytes, 0);
+        assert_eq!(active.consumer_active_bytes, expected_bytes);
+
+        limiter.release_consumer_active(byte_reservation);
+        let released = limiter.snapshot();
+        assert_eq!(released.bytes_in_flight, 0);
+        assert_eq!(released.sender_pending_bytes, 0);
+        assert_eq!(released.channel_pending_bytes, 0);
+        assert_eq!(released.consumer_active_bytes, 0);
+        assert_eq!(released.untracked_bytes, 0);
     }
 
     #[test]
@@ -33435,7 +33691,8 @@ mod tests {
                     60,
                     "producer should be blocked on the second reservation until the consumer releases the first"
                 );
-                limiter.release(byte_reservation);
+                limiter.move_channel_pending_to_consumer(byte_reservation);
+                limiter.release_consumer_active(byte_reservation);
             }
             other => panic!(
                 "expected first pending batch before capacity wait, got {:?}",
@@ -33455,7 +33712,8 @@ mod tests {
                 assert_eq!(conversations.len(), 1);
                 assert_eq!(conversations[0].external_id.as_deref(), Some("second"));
                 assert_eq!(byte_reservation, 60);
-                limiter.release(byte_reservation);
+                limiter.move_channel_pending_to_consumer(byte_reservation);
+                limiter.release_consumer_active(byte_reservation);
             }
             other => panic!(
                 "expected second batch after capacity release, got {:?}",
@@ -33490,6 +33748,7 @@ mod tests {
                 .expect("pending conversation should reserve bytes");
 
             assert_eq!(limiter.bytes_in_flight(), expected_bytes);
+            assert_eq!(limiter.snapshot().sender_pending_bytes, expected_bytes);
         }
 
         assert_eq!(
@@ -33497,6 +33756,11 @@ mod tests {
             0,
             "dropping an unflushed producer must not leak byte budget"
         );
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.sender_pending_bytes, 0);
+        assert_eq!(snapshot.channel_pending_bytes, 0);
+        assert_eq!(snapshot.consumer_active_bytes, 0);
+        assert_eq!(snapshot.untracked_bytes, 0);
         assert!(
             rx.try_recv().is_err(),
             "drop must not publish a partial batch"
@@ -33522,6 +33786,7 @@ mod tests {
             ))
             .expect("push should only reserve bytes before flush");
         assert_eq!(limiter.bytes_in_flight(), expected_bytes);
+        assert_eq!(limiter.snapshot().sender_pending_bytes, expected_bytes);
 
         let error = sender
             .flush()
@@ -33532,6 +33797,11 @@ mod tests {
             0,
             "flush failure must release the reservation exactly once"
         );
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.sender_pending_bytes, 0);
+        assert_eq!(snapshot.channel_pending_bytes, 0);
+        assert_eq!(snapshot.consumer_active_bytes, 0);
+        assert_eq!(snapshot.untracked_bytes, 0);
     }
 
     #[test]
