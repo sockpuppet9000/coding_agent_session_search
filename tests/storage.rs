@@ -510,6 +510,17 @@ fn fresh_db_creates_all_indexes() {
         !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
         "fresh schema should not retain redundant idx_messages_conv_idx, found: {message_indexes:?}"
     );
+
+    let tail_indexes: Vec<String> = storage
+        .raw()
+        .query_map_collect("PRAGMA index_list(conversation_tail_state)", &[], |r| {
+            r.get_typed(1)
+        })
+        .unwrap();
+    assert!(
+        tail_indexes.contains(&"idx_conversation_tail_state_last_created".to_string()),
+        "conversation_tail_state should support recent-session browse, found: {tail_indexes:?}"
+    );
 }
 
 #[test]

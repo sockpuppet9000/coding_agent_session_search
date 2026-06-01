@@ -2955,7 +2955,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -3582,6 +3582,14 @@ SELECT
      WHERE ts.conversation_id = c.id)
 FROM conversations c
 WHERE c.external_id IS NOT NULL;
+";
+
+const MIGRATION_V21: &str = r"
+-- Empty-query TUI browse reads one tail row per conversation ordered by last
+-- message time. Keep this one-row-per-conversation index instead of restoring
+-- the write-heavy global messages(created_at) index dropped in V17.
+CREATE INDEX IF NOT EXISTS idx_conversation_tail_state_last_created
+    ON conversation_tail_state(last_message_created_at DESC, conversation_id DESC);
 ";
 
 /// Row from the embedding_jobs table.
@@ -4635,6 +4643,11 @@ fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
         .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
         .add(19, "conversation_external_lookup", MIGRATION_V19)
         .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
+        .add(
+            21,
+            "conversation_tail_state_last_created_idx",
+            MIGRATION_V21,
+        )
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -5147,6 +5160,9 @@ CREATE TABLE IF NOT EXISTS conversation_tail_state (
     last_message_created_at INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS idx_conversation_tail_state_last_created
+    ON conversation_tail_state(last_message_created_at DESC, conversation_id DESC);
+
 CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (
     lookup_key TEXT PRIMARY KEY,
     conversation_id INTEGER NOT NULL,
@@ -5483,7 +5499,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 20] = [
+const MIGRATION_NAMES: [(i64, &str); 21] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -5504,6 +5520,7 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
     (18, "conversation_tail_state_hot_table"),
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
+    (21, "conversation_tail_state_last_created_idx"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the

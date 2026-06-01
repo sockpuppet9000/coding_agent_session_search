@@ -7393,12 +7393,13 @@ impl SearchClient {
         }
     }
 
-    /// Browse messages ordered by date, without any text query.
+    /// Browse sessions ordered by date, without any text query.
     ///
     /// Used when the TUI query is empty and the user wants to see recent (or
-    /// oldest) sessions. Bypasses BM25 scoring entirely and returns results
-    /// ordered by `created_at`. Applies agent, workspace, time-range, and
-    /// source filters identically to the normal search path.
+    /// oldest) sessions. Bypasses BM25 scoring entirely and returns one
+    /// representative tail-message hit per conversation. The query is driven by
+    /// `conversation_tail_state` instead of `messages(created_at)` so startup
+    /// does not require the intentionally removed global message-date index.
     pub fn browse_by_date(
         &self,
         filters: SearchFilters,
@@ -7440,15 +7441,16 @@ impl SearchClient {
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         let mut sql = format!(
-            "SELECT c.id, {title_expr}, m.content, \
+            "SELECT c.id, {title_expr}, COALESCE(m.content, ''), \
                  COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'), \
-                 w.path, c.source_path, m.created_at, m.idx, \
+                 w.path, c.source_path, ts.last_message_created_at, m.idx, \
                  {normalized_source_sql}, c.origin_host, s.kind
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
+             FROM conversation_tail_state ts
+             JOIN conversations c ON c.id = ts.conversation_id
+             LEFT JOIN messages m ON m.conversation_id = c.id AND m.idx = ts.last_message_idx
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE 1=1"
+             WHERE ts.last_message_created_at IS NOT NULL"
         );
         let mut params: Vec<ParamValue> = Vec::new();
 
@@ -7471,11 +7473,11 @@ impl SearchClient {
         }
 
         if let Some(created_from) = filters.created_from {
-            sql.push_str(" AND m.created_at >= ?");
+            sql.push_str(" AND ts.last_message_created_at >= ?");
             params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(" AND m.created_at <= ?");
+            sql.push_str(" AND ts.last_message_created_at <= ?");
             params.push(ParamValue::from(created_to));
         }
 
@@ -7497,7 +7499,7 @@ impl SearchClient {
         }
 
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN m.created_at IS NULL THEN 1 ELSE 0 END, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
+            " ORDER BY ts.last_message_created_at {order}, ts.conversation_id {order} LIMIT ? OFFSET ?"
         ));
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
@@ -12004,6 +12006,12 @@ mod tests {
                 content TEXT,
                 created_at INTEGER
              );
+             CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+             );
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
                 title,
@@ -12026,6 +12034,8 @@ mod tests {
         conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')")?;
         conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
         conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
+        conn.execute("INSERT INTO conversation_tail_state(conversation_id, last_message_idx, last_message_created_at) VALUES(1, 0, 42)")?;
+        conn.execute("INSERT INTO conversation_tail_state(conversation_id, last_message_idx, last_message_created_at) VALUES(2, 0, 43)")?;
         conn.execute_compat(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -12385,6 +12395,12 @@ mod tests {
                 content TEXT NOT NULL,
                 created_at INTEGER
              );
+             CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+             );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
@@ -12395,6 +12411,10 @@ mod tests {
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(1, 1, 0, 'browse auth token failure', 123)",
+        )?;
+        conn.execute(
+            "INSERT INTO conversation_tail_state(conversation_id, last_message_idx, last_message_created_at)
+             VALUES(1, 0, 123)",
         )?;
 
         let client = SearchClient {
@@ -13334,6 +13354,12 @@ mod tests {
                 content TEXT NOT NULL,
                 created_at INTEGER
              );
+             CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+             );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
@@ -13353,6 +13379,10 @@ mod tests {
                 fsqlite_types::value::SqliteValue::Text(first.clone().into()),
                 fsqlite_types::value::SqliteValue::Integer(101),
             ],
+        )?;
+        conn.execute(
+            "INSERT INTO conversation_tail_state(conversation_id, last_message_idx, last_message_created_at)
+             VALUES(1, 1, 102)",
         )?;
         conn.execute_with_params(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
@@ -13389,10 +13419,10 @@ mod tests {
             true,
             FieldMask::new(false, true, true, true),
         )?;
-        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.len(), 1);
         assert!(hits.iter().all(|hit| hit.content.is_empty()));
         assert!(hits.iter().all(|hit| !hit.snippet.is_empty()));
-        assert_ne!(hits[0].content_hash, hits[1].content_hash);
+        assert_eq!(hits[0].line_number, Some(2));
 
         Ok(())
     }
