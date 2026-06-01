@@ -10365,6 +10365,55 @@ struct StreamingProducerConfig {
     index_run_metadata_write_lock: Option<Arc<Mutex<()>>>,
 }
 
+#[derive(Clone, Copy)]
+struct LocalScanStageNames {
+    capture: &'static str,
+    scan: &'static str,
+    flush: &'static str,
+    done: &'static str,
+    error: &'static str,
+}
+
+const LOCAL_SCAN_STAGES: LocalScanStageNames = LocalScanStageNames {
+    capture: "local_capture_sources",
+    scan: "local_scan",
+    flush: "local_flush",
+    done: "local_done",
+    error: "local_error",
+};
+
+const LOCAL_FILE_SCAN_STAGES: LocalScanStageNames = LocalScanStageNames {
+    capture: "local_file_capture_sources",
+    scan: "local_file_scan",
+    flush: "local_file_flush",
+    done: "local_file_done",
+    error: "local_file_error",
+};
+
+fn codex_local_explicit_primary_file_roots(
+    connector: &(dyn Connector + Send),
+    ctx: &crate::connectors::ScanContext,
+) -> anyhow::Result<Vec<ScanRoot>> {
+    let mut roots = connector
+        .discover_source_files(ctx)?
+        .into_iter()
+        .filter(|source| {
+            source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
+                && source.source_path.is_file()
+        })
+        .map(|source| {
+            let mut root = ScanRoot::local(source.source_path);
+            root.origin = source.origin;
+            root.platform = source.platform;
+            root
+        })
+        .collect::<Vec<_>>();
+
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
+    roots.dedup_by(|left, right| left.path == right.path);
+    Ok(roots)
+}
+
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
 ///
 /// Each connector runs in its own thread, scanning the built-in local roots plus
@@ -10434,109 +10483,169 @@ fn spawn_connector_producer(
                 .cloned()
                 .map(ScanRoot::local)
                 .collect();
-            record_index_run_scan_state(
-                &config.data_dir,
-                metadata_write_lock,
-                progress_bump,
-                name,
-                "local_capture_sources",
-                "local",
-                None,
-            );
-            capture_connector_sources_before_parse(
-                conn.as_ref(),
-                &ctx,
-                &config.data_dir,
-                name,
-                &fallback_roots,
-                config.since_ts,
-                config.active_source_filter.as_ref(),
-            );
-            record_index_run_scan_state(
-                &config.data_dir,
-                metadata_write_lock,
-                progress_bump,
-                name,
-                "local_scan",
-                "local",
-                None,
-            );
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
-                bump_index_run_lock_progress_if_present(progress_bump);
-                if should_skip_active_session_source(
+
+            let mut run_local_scan = |scan_ctx: &crate::connectors::ScanContext,
+                                      capture_roots: &[ScanRoot],
+                                      stage_names: LocalScanStageNames,
+                                      scan_root: Option<&Path>|
+             -> bool {
+                record_index_run_scan_state(
+                    &config.data_dir,
+                    metadata_write_lock,
+                    progress_bump,
+                    name,
+                    stage_names.capture,
+                    "local",
+                    scan_root,
+                );
+                capture_connector_sources_before_parse(
+                    conn.as_ref(),
+                    scan_ctx,
+                    &config.data_dir,
+                    name,
+                    capture_roots,
+                    config.since_ts,
                     config.active_source_filter.as_ref(),
-                    LOCAL_SOURCE_ID,
-                    &conversation.source_path,
-                ) {
-                    return Ok(());
-                }
-                inject_provenance(&mut conversation, &local_origin);
-                compact_large_connector_extras(name, &mut conversation);
-                attach_raw_mirror_capture(&config.data_dir, &mut conversation);
-                batch_sender.push(conversation)
-            }) {
-                Ok(()) => {
-                    record_index_run_scan_state(
-                        &config.data_dir,
-                        metadata_write_lock,
-                        progress_bump,
-                        name,
-                        "local_flush",
-                        "local",
-                        None,
-                    );
-                    if let Err(error) = batch_sender.flush() {
-                        if is_streaming_consumer_disconnected(&error) {
-                            tracing::info!(
-                                connector = name,
-                                "streaming consumer disconnected; stopping producer"
-                            );
-                            return;
-                        }
-                        tracing::warn!(connector = name, "local flush failed: {}", error);
-                        let _ = tx.send(IndexMessage::ScanError {
-                            connector_name: name,
-                            error: format!("local flush failed: {error}"),
-                        });
-                    } else {
+                );
+                record_index_run_scan_state(
+                    &config.data_dir,
+                    metadata_write_lock,
+                    progress_bump,
+                    name,
+                    stage_names.scan,
+                    "local",
+                    scan_root,
+                );
+                match conn.scan_with_callback(scan_ctx, &mut |mut conversation| {
+                    bump_index_run_lock_progress_if_present(progress_bump);
+                    if should_skip_active_session_source(
+                        config.active_source_filter.as_ref(),
+                        LOCAL_SOURCE_ID,
+                        &conversation.source_path,
+                    ) {
+                        return Ok(());
+                    }
+                    inject_provenance(&mut conversation, &local_origin);
+                    compact_large_connector_extras(name, &mut conversation);
+                    attach_raw_mirror_capture(&config.data_dir, &mut conversation);
+                    batch_sender.push(conversation)
+                }) {
+                    Ok(()) => {
                         record_index_run_scan_state(
                             &config.data_dir,
                             metadata_write_lock,
                             progress_bump,
                             name,
-                            "local_done",
+                            stage_names.flush,
                             "local",
-                            None,
+                            scan_root,
                         );
+                        if let Err(error) = batch_sender.flush() {
+                            if is_streaming_consumer_disconnected(&error) {
+                                tracing::info!(
+                                    connector = name,
+                                    "streaming consumer disconnected; stopping producer"
+                                );
+                                return false;
+                            }
+                            tracing::warn!(connector = name, "local flush failed: {}", error);
+                            let _ = tx.send(IndexMessage::ScanError {
+                                connector_name: name,
+                                error: format!("local flush failed: {error}"),
+                            });
+                        } else {
+                            record_index_run_scan_state(
+                                &config.data_dir,
+                                metadata_write_lock,
+                                progress_bump,
+                                name,
+                                stage_names.done,
+                                "local",
+                                scan_root,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        record_index_run_scan_state(
+                            &config.data_dir,
+                            metadata_write_lock,
+                            progress_bump,
+                            name,
+                            stage_names.error,
+                            "local",
+                            scan_root,
+                        );
+                        if let Err(flush_error) = batch_sender.flush()
+                            && !is_streaming_consumer_disconnected(&flush_error)
+                        {
+                            tracing::warn!(connector = name, "local flush failed: {}", flush_error);
+                        }
+                        if is_streaming_consumer_disconnected(&e) {
+                            tracing::info!(
+                                connector = name,
+                                "streaming consumer disconnected; stopping producer"
+                            );
+                            return false;
+                        }
+                        tracing::warn!(connector = name, "local scan failed: {}", e);
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: e.to_string(),
+                        });
                     }
                 }
-                Err(e) => {
-                    record_index_run_scan_state(
-                        &config.data_dir,
-                        metadata_write_lock,
-                        progress_bump,
-                        name,
-                        "local_error",
-                        "local",
-                        None,
-                    );
-                    if let Err(flush_error) = batch_sender.flush()
-                        && !is_streaming_consumer_disconnected(&flush_error)
-                    {
-                        tracing::warn!(connector = name, "local flush failed: {}", flush_error);
-                    }
-                    if is_streaming_consumer_disconnected(&e) {
-                        tracing::info!(
+                true
+            };
+
+            let codex_file_roots = if name == "codex" {
+                record_index_run_scan_state(
+                    &config.data_dir,
+                    metadata_write_lock,
+                    progress_bump,
+                    name,
+                    "local_discover_sources",
+                    "local",
+                    None,
+                );
+                match codex_local_explicit_primary_file_roots(conn.as_ref(), &ctx) {
+                    Ok(roots) => roots,
+                    Err(error) => {
+                        tracing::warn!(
                             connector = name,
-                            "streaming consumer disconnected; stopping producer"
+                            error = %error,
+                            "codex local source discovery failed; falling back to default local scan"
                         );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            if codex_file_roots.is_empty() {
+                if !run_local_scan(&ctx, &fallback_roots, LOCAL_SCAN_STAGES, None::<&Path>) {
+                    return;
+                }
+            } else {
+                tracing::info!(
+                    connector = name,
+                    files = codex_file_roots.len(),
+                    "scanning codex local sources as explicit file roots"
+                );
+                for root in codex_file_roots {
+                    let file_ctx = crate::connectors::ScanContext::with_roots(
+                        root.path.clone(),
+                        vec![root.clone()],
+                        config.since_ts,
+                    );
+                    if !run_local_scan(
+                        &file_ctx,
+                        std::slice::from_ref(&root),
+                        LOCAL_FILE_SCAN_STAGES,
+                        Some(root.path.as_path()),
+                    ) {
                         return;
                     }
-                    tracing::warn!(connector = name, "local scan failed: {}", e);
-                    let _ = tx.send(IndexMessage::ScanError {
-                        connector_name: name,
-                        error: e.to_string(),
-                    });
                 }
             }
         }
@@ -32640,6 +32749,125 @@ mod tests {
         Box::new(DisconnectAwareConnector)
     }
 
+    #[derive(Clone)]
+    struct CodexExplicitFileRootFixture {
+        sources: Vec<PathBuf>,
+        scanned_roots: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    static CODEX_EXPLICIT_FILE_ROOT_FIXTURE: Mutex<Option<CodexExplicitFileRootFixture>> =
+        Mutex::new(None);
+
+    struct CodexExplicitFileRootConnector;
+
+    impl CodexExplicitFileRootConnector {
+        fn fixture() -> CodexExplicitFileRootFixture {
+            CODEX_EXPLICIT_FILE_ROOT_FIXTURE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("codex explicit file root fixture should be configured")
+        }
+    }
+
+    impl Connector for CodexExplicitFileRootConnector {
+        fn detect(&self) -> DetectionResult {
+            let fixture = Self::fixture();
+            let root_path = fixture
+                .sources
+                .first()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .expect("fixture should include a source parent");
+            DetectionResult {
+                detected: true,
+                evidence: vec!["codex-explicit-file-root".to_string()],
+                root_paths: vec![root_path],
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn discover_source_files(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<crate::connectors::DiscoveredSourceFile>> {
+            let fixture = Self::fixture();
+            let mut discovered = Vec::new();
+            for source_path in fixture.sources {
+                if !ctx.scan_roots.is_empty()
+                    && !ctx.scan_roots.iter().any(|root| root.path == source_path)
+                {
+                    continue;
+                }
+                let root = ctx
+                    .scan_roots
+                    .iter()
+                    .find(|root| root.path == source_path)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ScanRoot::local(
+                            source_path
+                                .parent()
+                                .map(Path::to_path_buf)
+                                .unwrap_or_else(|| source_path.clone()),
+                        )
+                    });
+                discovered.push(
+                    crate::connectors::DiscoveredSourceFile::new(
+                        "codex",
+                        &root,
+                        source_path,
+                        crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+            Ok(discovered)
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let fixture = Self::fixture();
+            assert_eq!(
+                ctx.scan_roots.len(),
+                1,
+                "codex local producer should call the connector once per explicit source file"
+            );
+            let source_path = ctx.scan_roots[0].path.clone();
+            assert!(
+                source_path.is_file(),
+                "codex local producer should pass an explicit file root"
+            );
+            fixture
+                .scanned_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(source_path.clone());
+
+            let external_id = source_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("codex-explicit-file-root");
+            let mut conversation = norm_conv(Some(external_id), vec![norm_msg(0, 1_700_000)]);
+            conversation.agent_slug = "codex".to_string();
+            conversation.source_path = source_path;
+            on_conversation(conversation)
+        }
+    }
+
+    fn codex_explicit_file_root_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(CodexExplicitFileRootConnector)
+    }
+
     #[test]
     fn next_streaming_batch_splits_large_message_batches() {
         let limits = StreamingBatchLimits {
@@ -34815,6 +35043,85 @@ mod tests {
         );
 
         *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[test]
+    fn streaming_codex_local_scan_uses_explicit_discovered_file_roots() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let sessions_dir = tmp.path().join(".codex/sessions/2026/06/01");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let first = sessions_dir.join("rollout-first.jsonl");
+        let second = sessions_dir.join("rollout-second.jsonl");
+        std::fs::write(&first, b"{\"fixture\":\"first\"}\n").unwrap();
+        std::fs::write(&second, b"{\"fixture\":\"second\"}\n").unwrap();
+
+        let scanned_roots = Arc::new(Mutex::new(Vec::new()));
+        *CODEX_EXPLICIT_FILE_ROOT_FIXTURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(CodexExplicitFileRootFixture {
+            sources: vec![second.clone(), first.clone()],
+            scanned_roots: scanned_roots.clone(),
+        });
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let handle = spawn_connector_producer(
+            "codex",
+            codex_explicit_file_root_connector_factory,
+            tx,
+            StreamingProducerConfig {
+                flow_limiter: flow_limiter.clone(),
+                data_dir: data_dir.clone(),
+                additional_scan_roots: Vec::new(),
+                since_ts: None,
+                progress: Some(progress.clone()),
+                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+                index_run_progress_bump: None,
+                index_run_metadata_write_lock: None,
+            },
+        );
+
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            flow_limiter,
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(discovered, vec!["codex".to_string()]);
+        assert_eq!(
+            mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 2,
+                inserted_messages: 2,
+            }
+        );
+        assert_eq!(
+            scanned_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[first, second],
+            "producer should sort discovered Codex sources and scan each one as its own root"
+        );
+
+        *CODEX_EXPLICIT_FILE_ROOT_FIXTURE
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
