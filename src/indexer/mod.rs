@@ -15,6 +15,7 @@ use self::refresh_ledger::{
 };
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -10200,14 +10201,18 @@ impl<'a> StreamingBatchSender<'a> {
                 || self.char_count.saturating_add(char_count)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if would_exceed_limits {
+            record_current_connector_scan_detail_stage("streaming_batch_limit_flush_start");
             self.flush()?;
+            record_current_connector_scan_detail_stage("streaming_batch_limit_flush_done");
         }
 
+        record_current_connector_scan_detail_stage("streaming_batch_acquire_start");
         let byte_reservation = self.flow_limiter.acquire(char_count).map_err(|_| {
             anyhow::Error::new(StreamingConsumerDisconnected {
                 connector_name: self.connector_name,
             })
         })?;
+        record_current_connector_scan_detail_stage("streaming_batch_acquire_done");
         self.message_count += message_count;
         self.char_count += char_count;
         self.byte_reservation = self.byte_reservation.saturating_add(byte_reservation);
@@ -10217,7 +10222,9 @@ impl<'a> StreamingBatchSender<'a> {
             && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
                 || self.char_count > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if single_conversation_exceeds_limits {
+            record_current_connector_scan_detail_stage("streaming_batch_oversized_flush_start");
             self.flush()?;
+            record_current_connector_scan_detail_stage("streaming_batch_oversized_flush_done");
         }
 
         Ok(())
@@ -10235,6 +10242,7 @@ impl<'a> StreamingBatchSender<'a> {
         let message_count = self.message_count;
         let byte_reservation = self.byte_reservation;
         let conversations = std::mem::take(&mut self.conversations);
+        record_current_connector_scan_detail_stage("streaming_batch_send_start");
         if let Err(_send_error) = self.tx.send(IndexMessage::Batch {
             connector_name: self.connector_name,
             conversations,
@@ -10242,6 +10250,7 @@ impl<'a> StreamingBatchSender<'a> {
             message_count,
             byte_reservation,
         }) {
+            record_current_connector_scan_detail_stage("streaming_batch_send_error");
             self.flow_limiter.release(byte_reservation);
             self.message_count = 0;
             self.char_count = 0;
@@ -10250,6 +10259,7 @@ impl<'a> StreamingBatchSender<'a> {
                 connector_name: self.connector_name,
             }));
         }
+        record_current_connector_scan_detail_stage("streaming_batch_send_done");
         self.message_count = 0;
         self.char_count = 0;
         self.byte_reservation = 0;
@@ -10369,6 +10379,13 @@ struct StreamingProducerConfig {
 struct LocalScanStageNames {
     capture: &'static str,
     scan: &'static str,
+    callback_received: &'static str,
+    filtered_active_source: &'static str,
+    raw_mirror_start: &'static str,
+    raw_mirror_done: &'static str,
+    batch_push_start: &'static str,
+    batch_push_done: &'static str,
+    batch_push_error: &'static str,
     flush: &'static str,
     done: &'static str,
     error: &'static str,
@@ -10377,6 +10394,13 @@ struct LocalScanStageNames {
 const LOCAL_SCAN_STAGES: LocalScanStageNames = LocalScanStageNames {
     capture: "local_capture_sources",
     scan: "local_scan",
+    callback_received: "local_callback_received",
+    filtered_active_source: "local_filtered_active_source",
+    raw_mirror_start: "local_raw_mirror_start",
+    raw_mirror_done: "local_raw_mirror_done",
+    batch_push_start: "local_batch_push_start",
+    batch_push_done: "local_batch_push_done",
+    batch_push_error: "local_batch_push_error",
     flush: "local_flush",
     done: "local_done",
     error: "local_error",
@@ -10385,10 +10409,80 @@ const LOCAL_SCAN_STAGES: LocalScanStageNames = LocalScanStageNames {
 const LOCAL_FILE_SCAN_STAGES: LocalScanStageNames = LocalScanStageNames {
     capture: "local_file_capture_sources",
     scan: "local_file_scan",
+    callback_received: "local_file_callback_received",
+    filtered_active_source: "local_file_filtered_active_source",
+    raw_mirror_start: "local_file_raw_mirror_start",
+    raw_mirror_done: "local_file_raw_mirror_done",
+    batch_push_start: "local_file_batch_push_start",
+    batch_push_done: "local_file_batch_push_done",
+    batch_push_error: "local_file_batch_push_error",
     flush: "local_file_flush",
     done: "local_file_done",
     error: "local_file_error",
 };
+
+#[derive(Clone)]
+struct ConnectorScanTelemetryContext {
+    data_dir: PathBuf,
+    metadata_write_lock: Option<Arc<Mutex<()>>>,
+    progress_bump: Option<Arc<AtomicI64>>,
+    connector: &'static str,
+    scope: &'static str,
+    root: Option<PathBuf>,
+}
+
+thread_local! {
+    static CONNECTOR_SCAN_TELEMETRY_CONTEXTS: RefCell<Vec<ConnectorScanTelemetryContext>> =
+        RefCell::new(Vec::new());
+}
+
+struct ConnectorScanTelemetryGuard;
+
+impl Drop for ConnectorScanTelemetryGuard {
+    fn drop(&mut self) {
+        CONNECTOR_SCAN_TELEMETRY_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().pop();
+        });
+    }
+}
+
+fn push_connector_scan_telemetry_context(
+    data_dir: PathBuf,
+    metadata_write_lock: Option<Arc<Mutex<()>>>,
+    progress_bump: Option<Arc<AtomicI64>>,
+    connector: &'static str,
+    scope: &'static str,
+    root: Option<PathBuf>,
+) -> ConnectorScanTelemetryGuard {
+    CONNECTOR_SCAN_TELEMETRY_CONTEXTS.with(|contexts| {
+        contexts.borrow_mut().push(ConnectorScanTelemetryContext {
+            data_dir,
+            metadata_write_lock,
+            progress_bump,
+            connector,
+            scope,
+            root,
+        });
+    });
+    ConnectorScanTelemetryGuard
+}
+
+pub(crate) fn record_current_connector_scan_detail_stage(stage: &'static str) {
+    let context =
+        CONNECTOR_SCAN_TELEMETRY_CONTEXTS.with(|contexts| contexts.borrow().last().cloned());
+    let Some(context) = context else {
+        return;
+    };
+    record_index_run_scan_state(
+        &context.data_dir,
+        context.metadata_write_lock.as_ref(),
+        context.progress_bump.as_ref(),
+        context.connector,
+        stage,
+        context.scope,
+        context.root.as_deref(),
+    );
+}
 
 fn codex_local_explicit_primary_file_roots(
     connector: &(dyn Connector + Send),
@@ -10516,19 +10610,94 @@ fn spawn_connector_producer(
                     "local",
                     scan_root,
                 );
+                let _scan_telemetry_guard = push_connector_scan_telemetry_context(
+                    config.data_dir.clone(),
+                    metadata_write_lock.cloned(),
+                    progress_bump.cloned(),
+                    name,
+                    "local",
+                    scan_root.map(Path::to_path_buf),
+                );
                 match conn.scan_with_callback(scan_ctx, &mut |mut conversation| {
                     bump_index_run_lock_progress_if_present(progress_bump);
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        stage_names.callback_received,
+                        "local",
+                        scan_root,
+                    );
                     if should_skip_active_session_source(
                         config.active_source_filter.as_ref(),
                         LOCAL_SOURCE_ID,
                         &conversation.source_path,
                     ) {
+                        record_index_run_scan_state(
+                            &config.data_dir,
+                            metadata_write_lock,
+                            progress_bump,
+                            name,
+                            stage_names.filtered_active_source,
+                            "local",
+                            scan_root,
+                        );
                         return Ok(());
                     }
                     inject_provenance(&mut conversation, &local_origin);
                     compact_large_connector_extras(name, &mut conversation);
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        stage_names.raw_mirror_start,
+                        "local",
+                        scan_root,
+                    );
                     attach_raw_mirror_capture(&config.data_dir, &mut conversation);
-                    batch_sender.push(conversation)
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        stage_names.raw_mirror_done,
+                        "local",
+                        scan_root,
+                    );
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        stage_names.batch_push_start,
+                        "local",
+                        scan_root,
+                    );
+                    let push_result = batch_sender.push(conversation);
+                    if push_result.is_ok() {
+                        record_index_run_scan_state(
+                            &config.data_dir,
+                            metadata_write_lock,
+                            progress_bump,
+                            name,
+                            stage_names.batch_push_done,
+                            "local",
+                            scan_root,
+                        );
+                    } else {
+                        record_index_run_scan_state(
+                            &config.data_dir,
+                            metadata_write_lock,
+                            progress_bump,
+                            name,
+                            stage_names.batch_push_error,
+                            "local",
+                            scan_root,
+                        );
+                    }
+                    push_result
                 }) {
                     Ok(()) => {
                         record_index_run_scan_state(
@@ -27591,6 +27760,61 @@ mod tests {
         assert!(
             snapshot.scan_updated_at_ms.is_some(),
             "snapshot should surface scan_updated_at_ms from lock metadata"
+        );
+        drop(guard);
+        Ok(())
+    }
+
+    #[test]
+    fn current_connector_scan_detail_stage_uses_thread_local_scan_context() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let root = tmp
+            .path()
+            .join("sessions/rollout-2026-06-01T00-00-00-test.jsonl");
+        let parent = root.parent().context("fixture root parent")?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(&root, b"{}\n")?;
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+
+        {
+            let _telemetry_guard = push_connector_scan_telemetry_context(
+                tmp.path().to_path_buf(),
+                Some(guard.metadata_write_lock.clone()),
+                Some(guard.last_progress_at_ms_atomic.clone()),
+                "codex",
+                "local",
+                Some(root.clone()),
+            );
+            record_current_connector_scan_detail_stage("codex_inner_scan_start");
+        }
+
+        let refreshed = std::fs::read_to_string(tmp.path().join("index-run.lock"))?;
+        for expected in [
+            "scan_connector=codex",
+            "scan_stage=codex_inner_scan_start",
+            "scan_scope=local",
+            "scan_codex_stage=codex_inner_scan_start",
+            "scan_codex_scope=local",
+        ] {
+            assert!(
+                refreshed.lines().any(|line| line == expected),
+                "thread-local scan telemetry line {expected:?} missing from {refreshed:?}"
+            );
+        }
+        assert!(
+            refreshed
+                .lines()
+                .any(|line| line == format!("scan_root={}", root.display())),
+            "thread-local scan telemetry should preserve the active source root: {refreshed:?}"
+        );
+        assert!(
+            refreshed
+                .lines()
+                .any(|line| line == format!("scan_codex_root={}", root.display())),
+            "per-connector telemetry should preserve the active Codex source root: {refreshed:?}"
         );
         drop(guard);
         Ok(())

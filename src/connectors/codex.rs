@@ -58,10 +58,26 @@ impl Connector for CodexConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner.scan_with_callback(ctx, &mut |mut conversation| {
+        crate::indexer::record_current_connector_scan_detail_stage("codex_inner_scan_start");
+        let result = self.inner.scan_with_callback(ctx, &mut |mut conversation| {
+            crate::indexer::record_current_connector_scan_detail_stage("codex_augment_start");
             augment_modern_codex_messages(&mut conversation);
-            on_conversation(conversation)
-        })
+            crate::indexer::record_current_connector_scan_detail_stage("codex_augment_done");
+            crate::indexer::record_current_connector_scan_detail_stage("codex_callback_start");
+            let callback_result = on_conversation(conversation);
+            if callback_result.is_ok() {
+                crate::indexer::record_current_connector_scan_detail_stage("codex_callback_done");
+            } else {
+                crate::indexer::record_current_connector_scan_detail_stage("codex_callback_error");
+            }
+            callback_result
+        });
+        if result.is_ok() {
+            crate::indexer::record_current_connector_scan_detail_stage("codex_inner_scan_done");
+        } else {
+            crate::indexer::record_current_connector_scan_detail_stage("codex_inner_scan_error");
+        }
+        result
     }
 }
 
