@@ -902,6 +902,29 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_searchable_index_metadata_contract(index_path: &Path) -> Result<()> {
+    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
+        validate_federated_search_manifest(index_path, &manifest, true)?;
+        federated_search_manifest_summary(index_path, &manifest)?;
+        return Ok(());
+    }
+
+    if !index_path.join("meta.json").exists() {
+        return Err(anyhow::anyhow!(
+            "standard lexical index metadata is missing in {}",
+            index_path.display()
+        ));
+    }
+    current_schema_hash_file_matches(index_path)?;
+    searchable_index_summary(index_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "standard lexical index summary is unavailable in {}",
+            index_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
     let meta_path = index_path.join("meta.json");
     if meta_path.exists() {
@@ -2609,6 +2632,37 @@ mod tests {
             "corrupt federated shard fingerprint should be rejected"
         );
         let error = result.err().expect("open result should contain an error");
+        assert!(
+            format!("{error:#}").contains("federated lexical shard fingerprint mismatch"),
+            "unexpected fingerprint error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn validate_searchable_index_metadata_contract_accepts_federated_bundle() {
+        let root = TempDir::new().expect("temp dir");
+        let published = publish_test_federated_bundle(root.path());
+
+        validate_searchable_index_metadata_contract(&published)
+            .expect("federated bundle metadata contract should validate");
+    }
+
+    #[test]
+    fn validate_searchable_index_metadata_contract_rejects_corrupt_federated_fingerprint() {
+        let root = TempDir::new().expect("temp dir");
+        let published = publish_test_federated_bundle(root.path());
+        let mut manifest = load_federated_search_manifest_internal(&published)
+            .expect("load manifest")
+            .expect("manifest present");
+        manifest
+            .shards
+            .first_mut()
+            .expect("test manifest should contain a shard")
+            .meta_fingerprint = "0".repeat(64);
+        write_federated_manifest_for_test(&published, &manifest);
+
+        let error = validate_searchable_index_metadata_contract(&published)
+            .expect_err("metadata contract should reject corrupt shard fingerprints");
         assert!(
             format!("{error:#}").contains("federated lexical shard fingerprint mismatch"),
             "unexpected fingerprint error: {error:#}"

@@ -5322,8 +5322,28 @@ fn acquire_index_run_lock(
     Ok(guard)
 }
 
-fn lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
+fn legacy_lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
     index_path.join(".lexical-rebuild-state.json")
+}
+
+fn lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
+    let generation_name = index_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("index"));
+    let file_name = format!(".{generation_name}.lexical-rebuild-state.json");
+    match index_path.parent() {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
+}
+
+fn lexical_rebuild_state_candidate_paths(index_path: &Path) -> [PathBuf; 2] {
+    [
+        lexical_rebuild_state_path(index_path),
+        legacy_lexical_rebuild_state_path(index_path),
+    ]
 }
 
 fn lexical_rebuild_equivalence_evidence_path(index_path: &Path) -> PathBuf {
@@ -6946,27 +6966,37 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
 }
 
 fn load_lexical_rebuild_state(index_path: &Path) -> Result<Option<LexicalRebuildState>> {
-    let path = lexical_rebuild_state_path(index_path);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading lexical rebuild state {}", path.display()));
-        }
-    };
+    let candidate_paths = lexical_rebuild_state_candidate_paths(index_path);
+    let mut first_read_error = None;
+    for path in &candidate_paths {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                first_read_error = Some(
+                    anyhow::Error::new(err)
+                        .context(format!("reading lexical rebuild state {}", path.display())),
+                );
+                continue;
+            }
+        };
 
-    match serde_json::from_slice::<LexicalRebuildState>(&bytes) {
-        Ok(state) => Ok(Some(state)),
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "ignoring malformed lexical rebuild checkpoint"
-            );
-            Ok(None)
+        match serde_json::from_slice::<LexicalRebuildState>(&bytes) {
+            Ok(state) => return Ok(Some(state)),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "ignoring malformed lexical rebuild checkpoint"
+                );
+            }
         }
     }
+
+    if let Some(err) = first_read_error {
+        return Err(err);
+    }
+    Ok(None)
 }
 
 fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState) -> Result<()> {
@@ -6975,14 +7005,17 @@ fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState)
 }
 
 fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
-    let path = lexical_rebuild_state_path(index_path);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("removing lexical rebuild state {}", path.display()))
+    for path in lexical_rebuild_state_candidate_paths(index_path) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("removing lexical rebuild state {}", path.display()));
+            }
         }
     }
+    Ok(())
 }
 
 fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
@@ -7693,10 +7726,12 @@ struct IncrementalCanonicalLexicalRepairContext {
     canonical_messages: usize,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
+    completed_checkpoint_indexed_docs: Option<usize>,
     /// True when a completed lexical-rebuild checkpoint records this exact
     /// canonical data (matching storage fingerprint). This is diagnostic
     /// context only: SQLite remains authoritative, and a fresh sparse live-doc
-    /// observation must still repair the derived lexical index.
+    /// observation must still repair the derived lexical index when it is
+    /// sparse relative to the checkpoint's indexed-doc count.
     published_index_validated_for_current_data: bool,
 }
 
@@ -7748,11 +7783,25 @@ fn choose_incremental_canonical_lexical_repair_plan(
     }
 
     let observed_tantivy_docs = context.observed_tantivy_docs?;
+    if let Some(completed_indexed_docs) = context.completed_checkpoint_indexed_docs {
+        if observed_tantivy_docs == completed_indexed_docs {
+            return None;
+        }
+        if observed_tantivy_docs < completed_indexed_docs {
+            return Some(IncrementalCanonicalLexicalRepairPlan {
+                canonical_messages: context.canonical_messages,
+                observed_tantivy_docs: Some(observed_tantivy_docs),
+                reason: "incremental_index_repairs_sparse_tantivy_from_completed_checkpoint_before_scan",
+            });
+        }
+    }
+
     if observed_tantivy_docs < context.canonical_messages {
         if context.published_index_validated_for_current_data {
             tracing::warn!(
                 canonical_messages = context.canonical_messages,
                 observed_tantivy_docs,
+                completed_checkpoint_indexed_docs = context.completed_checkpoint_indexed_docs,
                 "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse; repairing derived search assets from SQLite"
             );
         }
@@ -12057,6 +12106,8 @@ pub fn run_index(
             canonical_messages: 0,
             tantivy_requires_rebuild,
             observed_tantivy_docs,
+            completed_checkpoint_indexed_docs: initial_matching_lexical_checkpoint
+                .completed_indexed_docs,
             // Placeholder: validating the published index opens the DB read-only
             // and runs COUNT scans, so it is computed lazily below — only when the
             // live index actually looks sparse — to keep normal index/watch runs
@@ -14016,6 +14067,12 @@ fn ensure_index_storage_headroom(data_dir: &Path, db_path: &Path) -> Result<()> 
 
 fn index_disk_headroom_check_disabled() -> bool {
     dotenvy::var("CASS_INDEX_SKIP_DISK_HEADROOM_CHECK")
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn validate_published_lexical_reader_contract_after_rebuild() -> bool {
+    dotenvy::var("CASS_VALIDATE_PUBLISHED_LEXICAL_READER_CONTRACT")
         .map(|value| env_value_truthy(&value))
         .unwrap_or(false)
 }
@@ -17290,6 +17347,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         perf_profile.as_mut(),
     )?;
 
+    let mut post_publish_profile_step_started = Instant::now();
     let final_merge_inputs = final_merge_input_artifacts
         .unwrap_or_else(|| merge_coordinator.final_merge_input_artifacts());
     let final_merge_artifact = finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
@@ -17298,6 +17356,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         &final_merge_stage_root,
         shard_merge_settings.workers,
     )?;
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "finalize_staged_publish_artifact",
+    );
+    post_publish_profile_step_started = Instant::now();
     let merged_docs = final_merge_artifact.docs;
     if merged_docs != indexed_docs {
         return Err(anyhow::anyhow!(
@@ -17328,17 +17392,62 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         indexed_docs,
         &equivalence_evidence,
     )?;
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "persist_generation_artifacts",
+    );
+    post_publish_profile_step_started = Instant::now();
     let staged_published_meta_fingerprint =
         index_meta_fingerprint(&final_merge_artifact.publish_path)?;
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "fingerprint_staged_publish_artifact",
+    );
+    post_publish_profile_step_started = Instant::now();
     publish_staged_lexical_index(&final_merge_artifact.publish_path, index_path)?;
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "publish_staged_lexical_index",
+    );
+    post_publish_profile_step_started = Instant::now();
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
-    crate::search::tantivy::validate_searchable_index_contract(index_path).with_context(|| {
-        format!(
-            "validating staged lexical rebuild after publish: {}",
-            index_path.display()
-        )
-    })?;
+    crate::search::tantivy::validate_searchable_index_metadata_contract(index_path).with_context(
+        || {
+            format!(
+                "validating staged lexical rebuild metadata after publish: {}",
+                index_path.display()
+            )
+        },
+    )?;
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "validate_published_metadata_contract",
+    );
+    post_publish_profile_step_started = Instant::now();
+    if validate_published_lexical_reader_contract_after_rebuild() {
+        crate::search::tantivy::validate_searchable_index_contract(index_path).with_context(
+            || {
+                format!(
+                    "validating staged lexical rebuild readers after publish: {}",
+                    index_path.display()
+                )
+            },
+        )?;
+        bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+        log_lexical_rebuild_prep_profile_step(
+            prep_profile_started,
+            post_publish_profile_step_started,
+            "validate_published_reader_contract",
+        );
+        post_publish_profile_step_started = Instant::now();
+    }
     if let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)?
         && observed_tantivy_docs != indexed_docs
     {
@@ -17348,6 +17457,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             observed_tantivy_docs
         ));
     }
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "verify_published_doc_count",
+    );
+    post_publish_profile_step_started = Instant::now();
     let refresh_ledger =
         build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "atomic_staged_swap",
@@ -17360,6 +17475,13 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             equivalence_evidence: &equivalence_evidence,
         });
     persist_lexical_refresh_ledger(index_path, &refresh_ledger)?;
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "persist_refresh_ledger",
+    );
+    post_publish_profile_step_started = Instant::now();
     log_lexical_refresh_ledger_published(&refresh_ledger);
 
     storage.close_without_checkpoint().with_context(|| {
@@ -17368,6 +17490,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             db_path.display()
         )
     })?;
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "close_readonly_storage",
+    );
+    post_publish_profile_step_started = Instant::now();
     rebuild_state.db.storage_fingerprint = final_storage_fingerprint;
     rebuild_state.db.total_messages = final_observed_messages;
     rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
@@ -17376,6 +17504,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     rebuild_state.indexed_docs = indexed_docs;
     rebuild_state.mark_completed(staged_published_meta_fingerprint);
     persist_lexical_rebuild_state(index_path, &rebuild_state)?;
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        post_publish_profile_step_started,
+        "persist_completed_rebuild_state",
+    );
 
     if let Some(p) = &progress {
         p.phase.store(0, Ordering::Relaxed);
@@ -24145,6 +24279,7 @@ pub mod persist {
                 canonical_messages: 0,
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
+                completed_checkpoint_indexed_docs: None,
                 published_index_validated_for_current_data: false,
             };
 
@@ -24205,6 +24340,7 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
+                        completed_checkpoint_indexed_docs: None,
                         published_index_validated_for_current_data: false,
                     },
                 ),
@@ -24229,6 +24365,7 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
+                        completed_checkpoint_indexed_docs: None,
                         published_index_validated_for_current_data: false,
                     },
                 ),
@@ -24296,6 +24433,7 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
+                        completed_checkpoint_indexed_docs: None,
                         published_index_validated_for_current_data: false,
                     },
                 ),
@@ -24304,8 +24442,30 @@ pub mod persist {
         }
 
         #[test]
-        fn incremental_canonical_lexical_repair_plan_repairs_sparse_live_index_despite_checkpoint()
-        {
+        fn incremental_canonical_lexical_repair_plan_accepts_checkpoint_doc_count_below_messages() {
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: false,
+                        observed_tantivy_docs: Some(39),
+                        completed_checkpoint_indexed_docs: Some(39),
+                        published_index_validated_for_current_data: true,
+                    },
+                ),
+                None,
+                "some canonical messages may be intentionally non-searchable; \
+                 a completed checkpoint's indexed-doc count is the expected live Tantivy count"
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_repairs_sparse_live_index_below_checkpoint() {
             assert_eq!(
                 crate::indexer::choose_incremental_canonical_lexical_repair_plan(
                     crate::indexer::IncrementalCanonicalLexicalRepairContext {
@@ -24317,15 +24477,16 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
+                        completed_checkpoint_indexed_docs: Some(4),
                         published_index_validated_for_current_data: true,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
                     canonical_messages: 42,
                     observed_tantivy_docs: Some(3),
-                    reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+                    reason: "incremental_index_repairs_sparse_tantivy_from_completed_checkpoint_before_scan",
                 }),
-                "a matching checkpoint is not proof that the current live derived index covers SQLite"
+                "the checkpoint masks canonical-message/doc-count skew, not real live-index loss"
             );
 
             // The validation flag must NOT mask a genuinely missing/unopenable
@@ -24341,6 +24502,7 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
+                        completed_checkpoint_indexed_docs: Some(3),
                         published_index_validated_for_current_data: true,
                     },
                 )
@@ -37267,6 +37429,82 @@ mod tests {
 
     #[test]
     #[serial]
+    fn publish_staged_lexical_index_preserves_external_rebuild_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let old_conv = norm_conv(Some("checkpoint-old"), vec![norm_msg(0, 1_700_000_000_000)]);
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&old_conv, &old_conv.messages, Some(1))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+
+        let db_state = LexicalRebuildDbState {
+            db_path: data_dir
+                .join("agent_search.db")
+                .to_string_lossy()
+                .into_owned(),
+            total_conversations: 1,
+            total_messages: 1,
+            storage_fingerprint: "seed:checkpoint".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.committed_offset = 1;
+        state.committed_conversation_id = Some(1);
+        state.processed_conversations = 1;
+        state.indexed_docs = 1;
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let canonical_state_path = lexical_rebuild_state_path(&index_path);
+        let legacy_state_path = legacy_lexical_rebuild_state_path(&index_path);
+        assert!(
+            canonical_state_path.exists(),
+            "checkpoint should be stored outside the swappable live generation"
+        );
+        assert!(
+            !legacy_state_path.exists(),
+            "new writes should not recreate the legacy in-generation checkpoint"
+        );
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-stage.")
+            .tempdir_in(index_path.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv = norm_conv(
+            Some("checkpoint-new"),
+            vec![
+                norm_msg(0, 1_700_000_001_000),
+                norm_msg(1, 1_700_000_001_100),
+            ],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(2))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert!(
+            canonical_state_path.exists(),
+            "publishing a new live generation must not move or delete the rebuild checkpoint"
+        );
+        let loaded = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("external checkpoint should remain readable after publish");
+        assert_eq!(loaded.db.storage_fingerprint, "seed:checkpoint");
+        assert!(!loaded.is_incomplete());
+    }
+
+    #[test]
+    #[serial]
     fn publish_staged_lexical_index_moves_generation_audit_files_with_the_staged_directory() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -42035,6 +42273,61 @@ mod tests {
 
         let status = matching_lexical_rebuild_state_status(&index_path, &db_state).unwrap();
         assert!(!status.has_pending_resume);
+    }
+
+    #[test]
+    fn lexical_rebuild_state_path_lives_next_to_index_generation() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index").join("v8");
+
+        assert_eq!(
+            lexical_rebuild_state_path(&index_path),
+            tmp.path()
+                .join("index")
+                .join(".v8.lexical-rebuild-state.json")
+        );
+        assert_eq!(
+            legacy_lexical_rebuild_state_path(&index_path),
+            index_path.join(".lexical-rebuild-state.json")
+        );
+    }
+
+    #[test]
+    fn load_lexical_rebuild_state_reads_legacy_in_generation_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index").join("v8");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                total_messages: 24,
+                storage_fingerprint: "seed:legacy".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        let legacy_state_path = legacy_lexical_rebuild_state_path(&index_path);
+        fs::write(
+            &legacy_state_path,
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !lexical_rebuild_state_path(&index_path).exists(),
+            "pre-migration fixture should only populate the legacy path"
+        );
+        let loaded = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("legacy checkpoint should still load");
+        assert_eq!(loaded.db.storage_fingerprint, "seed:legacy");
+
+        clear_lexical_rebuild_state(&index_path).unwrap();
+        assert!(
+            !legacy_state_path.exists(),
+            "clear should also remove the legacy in-generation checkpoint"
+        );
     }
 
     #[test]
