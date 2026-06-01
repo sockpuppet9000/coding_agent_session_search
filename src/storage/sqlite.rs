@@ -2967,7 +2967,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -3181,6 +3181,8 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
 
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started
     ON conversations(agent_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_started_recent
+    ON conversations(started_at ASC, id ASC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv_idx
     ON messages(conversation_id, idx);
@@ -3297,6 +3299,7 @@ ALTER TABLE conversations_new RENAME TO conversations;
 
 -- Recreate indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_started_recent ON conversations(started_at ASC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 ";
 
@@ -3603,6 +3606,14 @@ const MIGRATION_V21: &str = r"
 -- the write-heavy global messages(created_at) index dropped in V17.
 CREATE INDEX IF NOT EXISTS idx_conversation_tail_state_last_created
     ON conversation_tail_state(last_message_created_at DESC, conversation_id DESC);
+";
+
+const MIGRATION_V22: &str = r"
+-- The storage-level conversation list is still used by tests, recovery paths,
+-- and fallback TUI surfaces. Keep its newest-first startup query index-backed
+-- instead of scanning every conversation and sorting in a temporary b-tree.
+CREATE INDEX IF NOT EXISTS idx_conversations_started_recent
+    ON conversations(started_at ASC, id ASC);
 ";
 
 /// Row from the embedding_jobs table.
@@ -4692,6 +4703,7 @@ fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
             "conversation_tail_state_last_created_idx",
             MIGRATION_V21,
         )
+        .add(22, "conversations_started_recent_idx", MIGRATION_V22)
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -5110,6 +5122,7 @@ CREATE TABLE IF NOT EXISTS usage_models_daily (
 
 -- All indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_started_recent ON conversations(started_at ASC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
@@ -5543,7 +5556,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 21] = [
+const MIGRATION_NAMES: [(i64, &str); 22] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -5565,6 +5578,7 @@ const MIGRATION_NAMES: [(i64, &str); 21] = [
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
     (21, "conversation_tail_state_last_created_idx"),
+    (22, "conversations_started_recent_idx"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -7375,17 +7389,52 @@ impl FrankenStorage {
             .with_context(|| "listing workspaces")
     }
 
+    fn list_conversation_from_row(
+        row: &FrankenRow,
+    ) -> std::result::Result<Conversation, frankensqlite::FrankenError> {
+        let workspace_path: Option<String> = row.get_typed(2)?;
+        let source_path: String = row.get_typed(5)?;
+        let raw_source_id: Option<String> = row.get_typed(10)?;
+        let raw_origin_host: Option<String> = row.get_typed(11)?;
+        let (source_id, _, origin_host) = normalized_storage_source_parts(
+            raw_source_id.as_deref(),
+            None,
+            raw_origin_host.as_deref(),
+        );
+        Ok(Conversation {
+            id: Some(row.get_typed(0)?),
+            agent_slug: row.get_typed(1)?,
+            workspace: workspace_path.map(|p| Path::new(&p).to_path_buf()),
+            external_id: row.get_typed(3)?,
+            title: row.get_typed(4)?,
+            source_path: Path::new(&source_path).to_path_buf(),
+            started_at: row.get_typed(6)?,
+            ended_at: row.get_typed(7)?,
+            approx_tokens: row.get_typed(8)?,
+            metadata_json: franken_read_metadata_compat(row, 9, 12),
+            messages: Vec::new(),
+            source_id,
+            origin_host,
+        })
+    }
+
     /// List conversations with pagination.
     pub fn list_conversations(&self, limit: i64, offset: i64) -> Result<Vec<Conversation>> {
+        let limit = limit.max(0);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let offset = offset.max(0);
         // Avoid the multi-table JOIN with LIMIT/OFFSET that triggers
         // frankensqlite's materialization fallback (see c38edcd9, 860acb12).
         // Use correlated subqueries for the tiny agents (~20 rows) and
         // workspaces (~30 rows) lookup tables and degrade NULL agent_id to
         // the same 'unknown' sentinel that 8a0c547c established for the
-        // lexical rebuild path.
-        self.conn
-            .query_map_collect(
-                r"SELECT c.id,
+        // lexical rebuild path. Keep NULL started_at rows last without using a
+        // CASE expression in the hot ORDER BY: the common non-NULL page stays
+        // backed by idx_conversations_started_recent, and the legacy NULL tail
+        // is only queried when the requested page reaches it.
+        const LIST_CONVERSATIONS_SELECT: &str = r"SELECT c.id,
                          COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
                          (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
                          c.external_id, c.title, c.source_path,
@@ -7398,38 +7447,53 @@ impl FrankenStorage {
                          ),
                          c.approx_tokens, c.metadata_json,
                          c.source_id, c.origin_host, c.metadata_bin
-                FROM conversations c
-                ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC
-                LIMIT ?1 OFFSET ?2",
+                FROM conversations c";
+
+        let mut conversations: Vec<Conversation> = self
+            .conn
+            .query_map_collect(
+                &format!(
+                    "{LIST_CONVERSATIONS_SELECT}
+                WHERE c.started_at IS NOT NULL
+                ORDER BY c.started_at DESC, c.id DESC
+                LIMIT ?1 OFFSET ?2"
+                ),
                 fparams![limit, offset],
-                |row| {
-                    let workspace_path: Option<String> = row.get_typed(2)?;
-                    let source_path: String = row.get_typed(5)?;
-                    let raw_source_id: Option<String> = row.get_typed(10)?;
-                    let raw_origin_host: Option<String> = row.get_typed(11)?;
-                    let (source_id, _, origin_host) = normalized_storage_source_parts(
-                        raw_source_id.as_deref(),
-                        None,
-                        raw_origin_host.as_deref(),
-                    );
-                    Ok(Conversation {
-                        id: Some(row.get_typed(0)?),
-                        agent_slug: row.get_typed(1)?,
-                        workspace: workspace_path.map(|p| Path::new(&p).to_path_buf()),
-                        external_id: row.get_typed(3)?,
-                        title: row.get_typed(4)?,
-                        source_path: Path::new(&source_path).to_path_buf(),
-                        started_at: row.get_typed(6)?,
-                        ended_at: row.get_typed(7)?,
-                        approx_tokens: row.get_typed(8)?,
-                        metadata_json: franken_read_metadata_compat(row, 9, 12),
-                        messages: Vec::new(),
-                        source_id,
-                        origin_host,
-                    })
-                },
+                Self::list_conversation_from_row,
             )
-            .with_context(|| "listing conversations")
+            .with_context(|| "listing conversations")?;
+
+        let remaining = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(conversations.len());
+        if remaining == 0 {
+            return Ok(conversations);
+        }
+
+        let non_null_count: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE started_at IS NOT NULL",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "counting non-null-start conversations for pagination")?;
+        let null_offset = offset.saturating_sub(non_null_count);
+        let mut null_tail = self
+            .conn
+            .query_map_collect(
+                &format!(
+                    "{LIST_CONVERSATIONS_SELECT}
+                WHERE c.started_at IS NULL
+                ORDER BY c.id DESC
+                LIMIT ?1 OFFSET ?2"
+                ),
+                fparams![i64::try_from(remaining).unwrap_or(i64::MAX), null_offset],
+                Self::list_conversation_from_row,
+            )
+            .with_context(|| "listing null-start conversations")?;
+        conversations.append(&mut null_tail);
+        Ok(conversations)
     }
 
     /// Build lookup maps for agents and workspaces to avoid JOINs in
@@ -20620,6 +20684,115 @@ mod tests {
         assert_eq!(
             bounded_paths,
             vec![PathBuf::from("/tmp/a.jsonl"), PathBuf::from("/tmp/b.jsonl")]
+        );
+    }
+
+    #[test]
+    fn list_conversations_newest_first_uses_started_recent_index() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |source_path: &str, started_at: Option<i64>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(source_path.to_string()),
+            title: Some(source_path.to_string()),
+            source_path: PathBuf::from(source_path),
+            started_at,
+            ended_at: started_at.map(|ts| ts + 1),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: started_at,
+                content: format!("message for {source_path}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        for conversation in [
+            make_conv("/tmp/old.jsonl", Some(1_000)),
+            make_conv("/tmp/new.jsonl", Some(3_000)),
+            make_conv("/tmp/mid.jsonl", Some(2_000)),
+            make_conv("/tmp/no-start.jsonl", None),
+        ] {
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+        }
+
+        let plan_details: Vec<String> = storage
+            .raw()
+            .query_map_collect(
+                r"EXPLAIN QUERY PLAN
+                  SELECT c.id,
+                         COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
+                         (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
+                         c.external_id, c.title, c.source_path,
+                         c.started_at,
+                         COALESCE(
+                             (SELECT ts.ended_at
+                              FROM conversation_tail_state ts
+                              WHERE ts.conversation_id = c.id),
+                             c.ended_at
+                         ),
+                         c.approx_tokens, c.metadata_json,
+                         c.source_id, c.origin_host, c.metadata_bin
+                   FROM conversations c
+                   WHERE c.started_at IS NOT NULL
+                   ORDER BY c.started_at DESC, c.id DESC
+                   LIMIT ?1 OFFSET ?2",
+                fparams![10_i64, 0_i64],
+                |row| row.get_typed(3),
+            )
+            .unwrap();
+
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_conversations_started_recent")),
+            "expected newest-first list query to use idx_conversations_started_recent, got {plan_details:?}"
+        );
+        assert!(
+            !plan_details
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "expected newest-first list query to avoid sorter temp b-trees, got {plan_details:?}"
+        );
+
+        let user_order: Vec<PathBuf> = storage
+            .list_conversations(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|conv| conv.source_path)
+            .collect();
+        assert_eq!(
+            user_order,
+            vec![
+                PathBuf::from("/tmp/new.jsonl"),
+                PathBuf::from("/tmp/mid.jsonl"),
+                PathBuf::from("/tmp/old.jsonl"),
+                PathBuf::from("/tmp/no-start.jsonl"),
+            ]
         );
     }
 
