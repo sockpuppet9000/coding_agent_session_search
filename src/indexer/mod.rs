@@ -16917,6 +16917,22 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut enqueued_shards,
                         producer_finished,
                     )?;
+                    maybe_persist_staged_lexical_rebuild_progress(
+                        index_path,
+                        &mut rebuild_state,
+                        last_processed_conversation_id,
+                        processed_conversations,
+                        indexed_docs,
+                        &latest_pipeline_runtime,
+                        staged_publish_base_meta_fingerprint.as_deref(),
+                        false,
+                        &mut conversations_since_progress_persist,
+                        progress_heartbeat_interval_conversations,
+                        &mut last_progress_persist,
+                        progress_heartbeat_interval,
+                        progress_bump.as_ref(),
+                        perf_profile.as_mut(),
+                    )?;
                 }
             }
         }
@@ -17092,6 +17108,22 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut active_shard_build_jobs,
                         &mut enqueued_shards,
                         true,
+                    )?;
+                    maybe_persist_staged_lexical_rebuild_progress(
+                        index_path,
+                        &mut rebuild_state,
+                        last_processed_conversation_id,
+                        processed_conversations,
+                        indexed_docs,
+                        &latest_pipeline_runtime,
+                        staged_publish_base_meta_fingerprint.as_deref(),
+                        false,
+                        &mut conversations_since_progress_persist,
+                        progress_heartbeat_interval_conversations,
+                        &mut last_progress_persist,
+                        progress_heartbeat_interval,
+                        progress_bump.as_ref(),
+                        perf_profile.as_mut(),
                     )?;
                 }
             }
@@ -42701,6 +42733,118 @@ mod tests {
                 .map(|pending| pending.next_conversation_id),
             Some(Some(6)),
             "forced staged heartbeat should keep the existing pending progress visible"
+        );
+    }
+
+    #[test]
+    fn maybe_persist_staged_lexical_rebuild_progress_time_heartbeat_refreshes_runtime_without_new_progress()
+     {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                total_messages: 24,
+                storage_fingerprint: "seed:12".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        let base_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
+        state.record_pending_commit(Some(6), 6, 12, base_meta_fingerprint.clone());
+        state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 0,
+            inflight_message_bytes: 0,
+            max_message_bytes_in_flight: 4_096,
+            page_prep_workers: 2,
+            controller_mode: "seeded".to_string(),
+            controller_reason: "seeded-runtime".to_string(),
+            staged_merge_workers_max: 2,
+            staged_merge_allowed_jobs: 1,
+            staged_merge_active_jobs: 1,
+            staged_merge_ready_artifacts: 8,
+            staged_merge_ready_groups: 1,
+            staged_merge_controller_reason: "seeded-merge".to_string(),
+            staged_shard_build_workers_max: 4,
+            staged_shard_build_allowed_jobs: 2,
+            staged_shard_build_active_jobs: 2,
+            staged_shard_build_pending_jobs: 3,
+            staged_shard_build_controller_reason: "seeded-builders".to_string(),
+            updated_at_ms: 1_733_000_777_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        });
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let heartbeat_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 0,
+            inflight_message_bytes: 0,
+            max_message_bytes_in_flight: 4_096,
+            page_prep_workers: 2,
+            controller_mode: "steady".to_string(),
+            controller_reason: "active_jobs_still_running".to_string(),
+            staged_merge_workers_max: 2,
+            staged_merge_allowed_jobs: 1,
+            staged_merge_active_jobs: 1,
+            staged_merge_ready_artifacts: 12,
+            staged_merge_ready_groups: 0,
+            staged_merge_controller_reason:
+                "producer_finished_final_frontier_within_federated_cap_32_active_jobs_1_ready_artifacts_12"
+                    .to_string(),
+            staged_shard_build_workers_max: 3,
+            staged_shard_build_allowed_jobs: 2,
+            staged_shard_build_active_jobs: 2,
+            staged_shard_build_pending_jobs: 43,
+            staged_shard_build_controller_reason:
+                "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_0".to_string(),
+            staged_shard_build_completed_jobs: 258,
+            staged_shard_build_last_shard_index: Some(256),
+            staged_shard_build_last_message_bytes: 15_429_584,
+            staged_shard_build_last_index_size_bytes: 8_777_548,
+            staged_shard_build_last_duration_ms: 679,
+            staged_shard_build_last_amplification_milli: Some(568),
+            staged_shard_build_observed_amplification_milli: Some(8_000),
+            updated_at_ms: 1_733_000_888_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let mut conversations_since_progress_persist = 0usize;
+        let mut last_progress_persist = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("old heartbeat instant");
+
+        let persisted = maybe_persist_staged_lexical_rebuild_progress(
+            &index_path,
+            &mut state,
+            Some(6),
+            6,
+            12,
+            &heartbeat_runtime,
+            base_meta_fingerprint.as_deref(),
+            false,
+            &mut conversations_since_progress_persist,
+            64,
+            &mut last_progress_persist,
+            Duration::from_secs(60),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(persisted);
+        assert_eq!(state.runtime, heartbeat_runtime);
+        let persisted_state = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("time heartbeat should persist");
+        assert_eq!(persisted_state.runtime, heartbeat_runtime);
+        assert_eq!(
+            persisted_state
+                .pending
+                .as_ref()
+                .map(|pending| pending.next_conversation_id),
+            Some(Some(6)),
+            "time-based staged heartbeat should preserve pending progress while refreshing runtime"
         );
     }
 
