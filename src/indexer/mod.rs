@@ -892,6 +892,8 @@ pub struct IndexingProgress {
     pub discovered_agent_names: Mutex<Vec<String>>,
     /// Last error message from background indexer, if any
     pub last_error: Mutex<Option<String>>,
+    /// Fine-grained startup/pre-scan step for phase=0 stall diagnostics.
+    pub preparation_step: Mutex<String>,
     /// Structured stats for JSON output (T7.4)
     pub stats: Mutex<IndexingStats>,
     /// Live authoritative rebuild queue depth for same-process progress output.
@@ -1000,6 +1002,14 @@ impl IndexingProgress {
             .map(|g| g.clone())
             .unwrap_or_default();
         let last_error: Option<String> = self.last_error.lock().ok().and_then(|g| g.clone());
+        let preparation_step = if phase == 0 {
+            self.preparation_step
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let rebuild_pipeline_queue_depth =
             self.rebuild_pipeline_queue_depth.load(Ordering::Relaxed);
         let rebuild_pipeline_inflight_message_bytes = self
@@ -1169,6 +1179,7 @@ impl IndexingProgress {
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
             "last_error": last_error,
+            "preparation_step": non_empty_json_string(preparation_step),
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
             "rebuild_pipeline": {
@@ -1500,6 +1511,25 @@ fn record_incremental_canonical_lexical_repair(
     }
 }
 
+fn set_progress_preparation_step(progress: Option<&Arc<IndexingProgress>>, step: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut current) = progress.preparation_step.lock() {
+        current.clear();
+        current.push_str(step);
+    }
+}
+
+fn clear_progress_preparation_step(progress: Option<&Arc<IndexingProgress>>) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut current) = progress.preparation_step.lock() {
+        current.clear();
+    }
+}
+
 fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
     let Some(progress) = progress else {
         return;
@@ -1507,6 +1537,7 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
 
     progress.phase.store(0, Ordering::Relaxed);
     progress.is_rebuilding.store(false, Ordering::Relaxed);
+    clear_progress_preparation_step(Some(progress));
     progress
         .rebuild_pipeline_queue_depth
         .store(0, Ordering::Relaxed);
@@ -11263,6 +11294,7 @@ pub fn run_index(
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     set_progress_last_error(opts.progress.as_ref(), None);
+    set_progress_preparation_step(opts.progress.as_ref(), "acquiring_index_run_lock");
     let initial_lock_mode = if opts.watch {
         SearchMaintenanceMode::WatchStartup
     } else if opts
@@ -11305,9 +11337,11 @@ pub fn run_index(
         return Ok(());
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_index_storage_headroom");
     let index_path = index_dir(&opts.data_dir)?;
     ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
+        set_progress_preparation_step(opts.progress.as_ref(), "checking_readonly_lexical_resume");
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
             &index_path,
             &opts.db_path,
@@ -11360,10 +11394,12 @@ pub fn run_index(
             }
         }
     }
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_readonly_force_rebuild");
     if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
         return Ok(());
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "opening_canonical_storage");
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let defer_checkpoints = !opts.watch;
@@ -11373,6 +11409,7 @@ pub fn run_index(
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
     // database" from frankensqlite.
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_storage_writable");
     if let Err(err) = storage
         .raw()
         .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
@@ -11404,6 +11441,7 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
 
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_db_resident_fts");
     if let Err(err) = storage.validate_fts_messages_integrity() {
         tracing::warn!(
             db_path = %opts.db_path.display(),
@@ -11429,6 +11467,7 @@ pub fn run_index(
         ));
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_watch_once_noop");
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
@@ -11457,6 +11496,7 @@ pub fn run_index(
     // poison every future run. A failed sweep is now fatal for this run:
     // continuing after OOM/corruption can reuse a poisoned connection and make
     // the canonical archive worse.
+    set_progress_preparation_step(opts.progress.as_ref(), "cleaning_orphan_fk_rows");
     if let Err(err) = storage.cleanup_orphan_fk_rows() {
         tracing::warn!(
             target: "cass::fk_repair",
@@ -11468,6 +11508,7 @@ pub fn run_index(
         return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "counting_canonical_sessions");
     let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     if opts.full
         && !opened_fresh_for_full
@@ -11508,6 +11549,10 @@ pub fn run_index(
         && initial_canonical_sessions_before_salvage > 0;
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
+    set_progress_preparation_step(
+        opts.progress.as_ref(),
+        "checking_lexical_rebuild_checkpoint",
+    );
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
         false
@@ -11609,6 +11654,7 @@ pub fn run_index(
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_tantivy_reader");
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
         // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
         // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
@@ -32461,6 +32507,24 @@ mod tests {
 
         assert_eq!(snapshot["phase_code"], serde_json::json!(2));
         assert_eq!(snapshot["phase"], serde_json::json!("indexing"));
+    }
+
+    #[test]
+    fn snapshot_json_includes_preparation_step_only_while_preparing() {
+        let progress = Arc::new(IndexingProgress::default());
+        set_progress_preparation_step(Some(&progress), "checking_tantivy_reader");
+
+        let preparing = progress.snapshot_json(120_000);
+        assert_eq!(preparing["phase_code"], serde_json::json!(0));
+        assert_eq!(
+            preparing["preparation_step"],
+            serde_json::json!("checking_tantivy_reader")
+        );
+
+        progress.phase.store(1, Ordering::Relaxed);
+        let scanning = progress.snapshot_json(121_000);
+        assert_eq!(scanning["phase"], serde_json::json!("scanning"));
+        assert_eq!(scanning["preparation_step"], serde_json::Value::Null);
     }
 
     #[test]

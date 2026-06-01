@@ -78972,6 +78972,10 @@ mod stall_diagnostics_tests {
         // Caller has not touched phase/current — still 0/0.
         assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
         assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+        *progress
+            .preparation_step
+            .lock()
+            .expect("preparation step lock") = "checking_tantivy_reader".to_string();
 
         let payload = watchdog.observe(&progress, 100);
         let payload = payload.expect(
@@ -78979,6 +78983,10 @@ mod stall_diagnostics_tests {
         );
         let obj = payload.as_object().expect("event payload is an object");
         assert_eq!(obj["event"], serde_json::json!("stall_detected"));
+        assert_eq!(
+            obj["preparation_step"],
+            serde_json::json!("checking_tantivy_reader")
+        );
         assert!(
             obj.contains_key("stall_elapsed_ms"),
             "watchdog event missing stall_elapsed_ms",
