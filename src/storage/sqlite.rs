@@ -1106,6 +1106,7 @@ pub const FTS5_REGISTER_SQL: &str = "\
 const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
 const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
+const ENV_PROBE_LEGACY_FTS_HEALTH: &str = "CASS_PROBE_LEGACY_FTS_HEALTH";
 const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
@@ -2015,10 +2016,11 @@ pub(crate) fn discover_historical_database_bundles(
     }
 
     fn bundle_health_rank(bundle: &HistoricalDatabaseBundle) -> i32 {
-        // Classify FTS health. The probe only sets `fts_queryable = true`
-        // when `fts_schema_rows == Some(1)` (see
-        // `historical_bundle_fts_queryable_via_frankensqlite`), so we have
-        // two legitimate "clean" shapes for a bundle:
+        // Classify FTS health. `fts_queryable` is now opt-in diagnostic
+        // metadata (`CASS_PROBE_LEGACY_FTS_HEALTH`) because Tantivy is the
+        // active lexical index and malformed legacy FTS tables must not block
+        // startup discovery. We still recognize two legitimate "clean" shapes
+        // for a bundle:
         //
         //   * `fts_schema_rows == Some(1) && fts_queryable` — a pre-V14
         //     bundle where the FTS virtual table was eagerly created by
@@ -2084,47 +2086,17 @@ pub(crate) fn discover_historical_database_bundles(
 }
 
 fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
-    let Ok(conn) = open_historical_bundle_readonly(root_path) else {
-        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or_default();
-    };
-
-    let schema_version = read_meta_schema_version(&conn).ok().flatten();
-    let fts_schema_rows: Option<i64> = conn
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            fparams![],
-            |row| row.get_typed(0),
-        )
-        .ok();
-    let fts_queryable =
-        historical_bundle_fts_queryable_via_frankensqlite(root_path, fts_schema_rows);
-    let max_message_id: i64 = conn
-        .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM messages",
-            fparams![],
-            |row| row.get_typed(0),
-        )
-        .unwrap_or(0);
-
-    let probe = HistoricalBundleProbe {
-        schema_version,
-        fts_schema_rows,
-        fts_queryable,
-        max_message_id,
-    };
-
-    if probe.schema_version.is_none()
-        && probe.fts_schema_rows.is_none()
-        && probe.max_message_id == 0
-    {
-        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or(probe);
-    }
-
+    // Historical bundle discovery runs on every ordinary index startup. Keep it
+    // metadata-only and outside FrankenSQLite so corrupt legacy FTS or damaged
+    // backup pages cannot wedge the common path.
+    let mut probe = probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or_default();
+    probe.fts_queryable =
+        historical_bundle_fts_queryable_via_frankensqlite(root_path, probe.fts_schema_rows);
     probe
 }
 
 fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<HistoricalBundleProbe> {
-    let bundle_uri = format!("file:{}?immutable=1", root_path.to_string_lossy());
+    let bundle_uri = format!("file:{}?mode=ro", root_path.to_string_lossy());
     let output = Command::new("sqlite3")
         .arg("-batch")
         .arg("-noheader")
@@ -2162,21 +2134,53 @@ fn historical_bundle_fts_queryable_via_frankensqlite(
     root_path: &Path,
     fts_schema_rows: Option<i64>,
 ) -> bool {
-    matches!(fts_schema_rows, Some(1))
-        && FrankenStorage::open_readonly(root_path)
-            .map(|storage| {
-                storage
-                    .raw()
-                    .query("SELECT COUNT(*) FROM fts_messages")
-                    .is_ok()
-            })
-            .unwrap_or(false)
+    if !matches!(fts_schema_rows, Some(1)) || !env_flag_enabled(ENV_PROBE_LEGACY_FTS_HEALTH) {
+        return false;
+    }
+
+    FrankenStorage::open_readonly(root_path)
+        .map(|storage| {
+            storage
+                .raw()
+                .query(FTS_MESSAGES_INTEGRITY_PROBE_SQL)
+                .is_ok()
+        })
+        .unwrap_or(false)
 }
 
 fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
-    open_historical_bundle_readonly(root_path)
-        .and_then(|conn| historical_bundle_has_queryable_core_tables(&conn))
-        .is_ok()
+    historical_bundle_core_tables_queryable_via_sqlite3_metadata(root_path)
+}
+
+fn historical_bundle_core_tables_queryable_via_sqlite3_metadata(root_path: &Path) -> bool {
+    let bundle_uri = format!("file:{}?mode=ro", root_path.to_string_lossy());
+    let output = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-noheader")
+        .arg(&bundle_uri)
+        .arg(
+            "PRAGMA writable_schema=ON;
+             SELECT COUNT(*) FROM sqlite_master
+               WHERE type = 'table' AND name IN ('conversations', 'messages');
+             SELECT rowid FROM conversations LIMIT 1;
+             SELECT rowid FROM messages LIMIT 1;",
+        )
+        .output()
+        .ok();
+    let Some(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    stdout
+        .lines()
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        == Some(2)
 }
 
 fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
@@ -22674,6 +22678,29 @@ mod tests {
     }
 
     #[test]
+    fn historical_bundle_fts_queryability_probe_is_opt_in() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute_batch(FTS5_REGISTER_SQL).unwrap();
+        drop(conn);
+
+        let disabled = set_env_var(ENV_PROBE_LEGACY_FTS_HEALTH, "0");
+        assert!(!historical_bundle_fts_queryable_via_frankensqlite(
+            &db_path,
+            Some(1)
+        ));
+        drop(disabled);
+
+        let enabled = set_env_var(ENV_PROBE_LEGACY_FTS_HEALTH, "1");
+        assert!(historical_bundle_fts_queryable_via_frankensqlite(
+            &db_path,
+            Some(1)
+        ));
+        drop(enabled);
+    }
+
+    #[test]
     fn salvage_historical_databases_skips_unreadable_quarantined_bundles() {
         let dir = TempDir::new().unwrap();
         let canonical_db = dir.path().join("agent_search.db");
@@ -22844,12 +22871,17 @@ mod tests {
         // `fts_queryable` mirrors a direct rusqlite probe; with 0 sqlite_master
         // rows the table isn't queryable until lazy repair runs.
         assert!(!bundles[0].probe.fts_queryable);
-        assert_eq!(bundles[1].probe.schema_version, Some(13));
+        let expected_replay_schema_version = if cfg!(windows) { Some(13) } else { None };
+        assert_eq!(
+            bundles[1].probe.schema_version,
+            expected_replay_schema_version
+        );
         // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
         // the test rolls meta.schema_version back to 13 and deletes the V14
         // marker. On Unix CI we also inject a duplicate sqlite_master row to
-        // exercise the malformed-bundle probe path that depends on sqlite3.
-        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
+        // exercise the malformed-bundle path; metadata-only startup probing
+        // must decline that bundle instead of opening it through FrankenSQLite.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { None };
         assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 

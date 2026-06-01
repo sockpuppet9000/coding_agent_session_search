@@ -100,6 +100,7 @@ const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
+const ENV_CHECK_PENDING_HISTORICAL_BUNDLES: &str = "CASS_CHECK_PENDING_HISTORICAL_BUNDLES";
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
@@ -7777,6 +7778,18 @@ fn should_salvage_historical_databases(
         || has_pending_historical_bundles
 }
 
+fn should_check_pending_historical_bundles(
+    canonical_storage_rebuilt: bool,
+    canonical_sessions_before_salvage: usize,
+    canonical_only_full_rebuild: bool,
+    operator_requested_check: bool,
+) -> bool {
+    if canonical_only_full_rebuild {
+        return false;
+    }
+    canonical_storage_rebuilt || canonical_sessions_before_salvage == 0 || operator_requested_check
+}
+
 fn should_run_targeted_watch_once_only(
     has_watch_once_paths: bool,
     watch_enabled: bool,
@@ -11673,6 +11686,10 @@ pub fn run_index(
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
         // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
         // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
+        set_progress_preparation_step(
+            opts.progress.as_ref(),
+            "checking_tantivy_reader.schema_hash",
+        );
         let schema_hash_path = index_path.join("schema_hash.json");
         let schema_matches = schema_hash_path.exists()
             && std::fs::read_to_string(&schema_hash_path)
@@ -11686,6 +11703,7 @@ pub fn run_index(
                 .unwrap_or(false);
 
         // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
+        set_progress_preparation_step(opts.progress.as_ref(), "checking_tantivy_reader.exists");
         tantivy_requires_rebuild = opts.force_rebuild
             || !crate::search::tantivy::searchable_index_exists(&index_path)
             || !schema_matches;
@@ -11694,17 +11712,33 @@ pub fn run_index(
         // rebuild so we do a full scan and reindex messages into the new index
         // (SQLite is incremental-only by default).
         if !tantivy_requires_rebuild {
+            set_progress_preparation_step(
+                opts.progress.as_ref(),
+                "checking_tantivy_reader.summary",
+            );
             match crate::search::tantivy::searchable_index_summary(&index_path) {
                 Ok(Some(summary)) => {
-                    if let Err(e) =
-                        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            path = %index_path.display(),
-                            "tantivy contract preflight failed; forcing rebuild"
+                    let validate_reader_preflight =
+                        dotenvy::var("CASS_VALIDATE_TANTIVY_READER_PRECHECK")
+                            .map(|value| env_value_truthy(&value))
+                            .unwrap_or(false);
+                    if validate_reader_preflight {
+                        set_progress_preparation_step(
+                            opts.progress.as_ref(),
+                            "checking_tantivy_reader.contract",
                         );
-                        tantivy_requires_rebuild = true;
+                        if let Err(e) =
+                            crate::search::tantivy::validate_searchable_index_contract(&index_path)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                path = %index_path.display(),
+                                "tantivy contract preflight failed; forcing rebuild"
+                            );
+                            tantivy_requires_rebuild = true;
+                        } else {
+                            observed_tantivy_docs = Some(summary.docs);
+                        }
                     } else {
                         observed_tantivy_docs = Some(summary.docs);
                     }
@@ -11735,6 +11769,7 @@ pub fn run_index(
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_tantivy_reader.done");
     let mut needs_rebuild =
         should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
     let initial_needs_rebuild = needs_rebuild;
@@ -11861,11 +11896,32 @@ pub fn run_index(
         let canonical_sessions_before_salvage = initial_canonical_sessions_before_salvage;
         // See CASS #153: plain --full must always rescan the filesystem.
         // --force-rebuild with existing sessions skips rescan (fast path).
-        let mut has_pending_historical_bundles = if canonical_only_full_rebuild {
-            false
-        } else {
+        let operator_requested_historical_bundle_check =
+            dotenvy::var(ENV_CHECK_PENDING_HISTORICAL_BUNDLES)
+                .map(|value| env_value_truthy(&value))
+                .unwrap_or(false);
+        let check_pending_historical_bundles = should_check_pending_historical_bundles(
+            canonical_storage_rebuilt,
+            canonical_sessions_before_salvage,
+            canonical_only_full_rebuild,
+            operator_requested_historical_bundle_check,
+        );
+        let mut has_pending_historical_bundles = if check_pending_historical_bundles {
+            set_progress_preparation_step(opts.progress.as_ref(), "checking_historical_bundles");
             storage.has_pending_historical_bundles(&opts.db_path)?
+        } else {
+            set_progress_preparation_step(opts.progress.as_ref(), "skipping_historical_bundles");
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                canonical_sessions_before_salvage,
+                canonical_storage_rebuilt,
+                canonical_only_full_rebuild,
+                env = ENV_CHECK_PENDING_HISTORICAL_BUNDLES,
+                "skipping pending historical bundle discovery during populated ordinary startup"
+            );
+            false
         };
+        set_progress_preparation_step(opts.progress.as_ref(), "deciding_historical_salvage");
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             has_explicit_watch_once_paths,
             opts.watch,
@@ -11959,6 +12015,10 @@ pub fn run_index(
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
         {
+            set_progress_preparation_step(
+                opts.progress.as_ref(),
+                "checking_incremental_lexical_repair.canonical_messages",
+            );
             let canonical_messages = count_total_messages_exact(&storage)?;
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
@@ -11967,16 +12027,22 @@ pub fn run_index(
             // index rebuilds regardless (handled in
             // choose_incremental_canonical_lexical_repair_plan via
             // tantivy_requires_rebuild), so skip the check then.
-            let published_index_validated_for_current_data =
+            let validate_published_index_fingerprint =
                 dotenvy::var("CASS_VALIDATE_PUBLISHED_INDEX_FINGERPRINT")
                     .map(|value| env_value_truthy(&value))
-                    .unwrap_or(false)
-                    && !tantivy_requires_rebuild
-                    && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
-                    && published_lexical_index_validated_for_current_data(
-                        &index_path,
-                        &opts.db_path,
-                    );
+                    .unwrap_or(false);
+            let published_index_validated_for_current_data = if validate_published_index_fingerprint
+                && !tantivy_requires_rebuild
+                && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
+            {
+                set_progress_preparation_step(
+                    opts.progress.as_ref(),
+                    "checking_incremental_lexical_repair.published_fingerprint",
+                );
+                published_lexical_index_validated_for_current_data(&index_path, &opts.db_path)
+            } else {
+                false
+            };
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
@@ -34915,6 +34981,25 @@ mod tests {
     fn historical_salvage_decision_skips_pending_bundles_during_canonical_only_full_rebuild() {
         assert!(!should_salvage_historical_databases(
             false, 43_678, true, true
+        ));
+    }
+
+    #[test]
+    fn pending_historical_bundle_discovery_is_not_on_populated_startup_critical_path() {
+        assert!(!should_check_pending_historical_bundles(
+            false, 43_678, false, false
+        ));
+        assert!(should_check_pending_historical_bundles(
+            false, 43_678, false, true
+        ));
+        assert!(should_check_pending_historical_bundles(
+            true, 43_678, false, false
+        ));
+        assert!(should_check_pending_historical_bundles(
+            false, 0, false, false
+        ));
+        assert!(!should_check_pending_historical_bundles(
+            true, 0, true, true
         ));
     }
 
