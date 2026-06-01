@@ -11589,14 +11589,24 @@ pub fn run_index(
                     })?;
             }
         } else {
-            initial_matching_lexical_checkpoint =
-                matching_lexical_rebuild_state_status_if_present(&index_path, || {
-                    lexical_rebuild_db_state_with_total_conversations(
-                        &storage,
-                        &opts.db_path,
-                        initial_canonical_sessions_before_salvage,
-                    )
-                })?;
+            if let Some(status) =
+                matching_completed_lexical_rebuild_state_status_without_fingerprint(
+                    &index_path,
+                    &opts.db_path,
+                    initial_canonical_sessions_before_salvage,
+                )?
+            {
+                initial_matching_lexical_checkpoint = status;
+            } else {
+                initial_matching_lexical_checkpoint =
+                    matching_lexical_rebuild_state_status_if_present(&index_path, || {
+                        lexical_rebuild_db_state_with_total_conversations(
+                            &storage,
+                            &opts.db_path,
+                            initial_canonical_sessions_before_salvage,
+                        )
+                    })?;
+            }
         }
         initial_matching_lexical_checkpoint.has_pending_resume
     } else {
@@ -11957,9 +11967,16 @@ pub fn run_index(
             // index rebuilds regardless (handled in
             // choose_incremental_canonical_lexical_repair_plan via
             // tantivy_requires_rebuild), so skip the check then.
-            let published_index_validated_for_current_data = !tantivy_requires_rebuild
-                && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
-                && published_lexical_index_validated_for_current_data(&index_path, &opts.db_path);
+            let published_index_validated_for_current_data =
+                dotenvy::var("CASS_VALIDATE_PUBLISHED_INDEX_FINGERPRINT")
+                    .map(|value| env_value_truthy(&value))
+                    .unwrap_or(false)
+                    && !tantivy_requires_rebuild
+                    && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
+                    && published_lexical_index_validated_for_current_data(
+                        &index_path,
+                        &opts.db_path,
+                    );
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
