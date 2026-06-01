@@ -4422,8 +4422,20 @@ impl FrankenStorage {
     /// The pass is idempotent (a clean database is a no-op), and emits a
     /// `WARN` after successful cleanup so the upstream `drop_close` condition
     /// stays visible.
+    #[cfg(test)]
     pub(crate) fn cleanup_orphan_fk_rows(&self) -> Result<OrphanFkCleanupReport> {
+        self.cleanup_orphan_fk_rows_with_step(|_| {})
+    }
+
+    pub(crate) fn cleanup_orphan_fk_rows_with_step<F>(
+        &self,
+        mut record_step: F,
+    ) -> Result<OrphanFkCleanupReport>
+    where
+        F: FnMut(&str),
+    {
         let mut report = OrphanFkCleanupReport::default();
+        record_step("cleaning_orphan_fk_rows.messages_probe");
         let orphan_message_ids = match collect_orphan_message_ids(&self.conn) {
             Ok(ids) => ids,
             Err(err) if error_indicates_missing_table(&err) => {
@@ -4442,12 +4454,30 @@ impl FrankenStorage {
         }
 
         if !orphan_message_ids.is_empty() {
+            record_step("cleaning_orphan_fk_rows.messages_delete");
             delete_orphan_message_ids_bisecting_oom(&self.conn, &orphan_message_ids)
                 .context("deleting orphan message rows and dependent children")?;
         }
 
         for entry in ORPHAN_DIRECT_CHILD_TABLES {
+            let probe_step = format!("cleaning_orphan_fk_rows.{}_probe", entry.child_table);
+            let delete_step = format!("cleaning_orphan_fk_rows.{}_delete", entry.child_table);
+            record_step(&probe_step);
+            let mut record_child_probe_step = |step: &str| {
+                let step = format!("cleaning_orphan_fk_rows.{}.{}", entry.child_table, step);
+                record_step(&step);
+            };
+            if child_keys_are_covered_by_parent_boundary_fast_path(
+                &self.conn,
+                entry,
+                &mut record_child_probe_step,
+            )
+            .with_context(|| format!("checking {} parent-key coverage", entry.child_table))?
+            {
+                continue;
+            }
             loop {
+                record_step(&probe_step);
                 let ids = match collect_direct_orphan_id_page(&self.conn, entry) {
                     Ok(ids) => ids,
                     Err(err)
@@ -4475,6 +4505,7 @@ impl FrankenStorage {
                     break;
                 }
 
+                record_step(&delete_step);
                 let deleted = delete_direct_orphan_ids_bisecting_oom(&self.conn, entry, &ids)
                     .with_context(|| format!("deleting orphan rows from {}", entry.child_table))?;
                 if deleted == 0 {
@@ -5696,6 +5727,10 @@ fn error_indicates_missing_column(err: &impl std::fmt::Display) -> bool {
 }
 
 const ORPHAN_FK_ID_CHUNK_SIZE: usize = 256;
+// Direct-child exact orphan scans are cheap on small ranges and preserve full
+// repair coverage for targeted corruption cases. Large child tables use a
+// boundary fast path to keep indexer startup bounded on clean production DBs.
+const ORPHAN_FK_EXACT_DIRECT_CHILD_RANGE_LIMIT: i64 = 100_000;
 
 fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
     let min_conversation_id = conn
@@ -5723,6 +5758,16 @@ fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
             |row| row.get_typed(0),
         )
         .context("finding maximum message conversation id for orphan FK cleanup")?;
+
+    if parent_range_is_contiguous(
+        conn,
+        "conversations",
+        "id",
+        min_conversation_id,
+        max_conversation_id,
+    )? {
+        return Ok(Vec::new());
+    }
 
     let parent_conversation_ids: Vec<i64> = conn
         .query_map_collect(
@@ -5769,6 +5814,35 @@ fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
     Ok(message_ids)
 }
 
+fn parent_range_is_contiguous(
+    conn: &FrankenConnection,
+    parent_table: &'static str,
+    parent_id_column: &'static str,
+    min_child_parent_id: i64,
+    max_child_parent_id: i64,
+) -> Result<bool> {
+    let expected = max_child_parent_id
+        .checked_sub(min_child_parent_id)
+        .and_then(|value| value.checked_add(1));
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    let sql =
+        format!("SELECT COUNT(*) FROM {parent_table} WHERE {parent_id_column} BETWEEN ?1 AND ?2");
+    let parent_count: i64 = conn
+        .query_row_map(
+            &sql,
+            fparams![min_child_parent_id, max_child_parent_id],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| {
+            format!(
+                "counting parent ids in {parent_table}.{parent_id_column} for orphan FK cleanup"
+            )
+        })?;
+    Ok(parent_count == expected)
+}
+
 fn collect_message_ids_for_conversation_gap(
     conn: &FrankenConnection,
     gap_start: i64,
@@ -5794,6 +5868,96 @@ fn collect_message_ids_for_conversation_gap(
         message_ids.push(row.get_typed(0)?);
     }
     Ok(())
+}
+
+fn child_keys_are_covered_by_parent_boundary_fast_path(
+    conn: &FrankenConnection,
+    entry: &'static OrphanFkTable,
+    record_step: &mut impl FnMut(&str),
+) -> Result<bool> {
+    record_step("bounds_min");
+    let min_sql = format!(
+        "SELECT {column} FROM {table} ORDER BY {column} ASC LIMIT 1",
+        column = entry.child_key_column,
+        table = entry.child_table
+    );
+    let min_child_parent_id = conn
+        .query_map_collect(&min_sql, fparams![], |row| row.get_typed::<i64>(0))
+        .with_context(|| {
+            format!(
+                "reading minimum {}.{} key for orphan FK cleanup",
+                entry.child_table, entry.child_key_column
+            )
+        })?
+        .into_iter()
+        .next();
+    let Some(min_child_parent_id) = min_child_parent_id else {
+        return Ok(true);
+    };
+
+    record_step("bounds_max");
+    let max_sql = format!(
+        "SELECT {column} FROM {table} ORDER BY {column} DESC LIMIT 1",
+        column = entry.child_key_column,
+        table = entry.child_table
+    );
+    let max_child_parent_id: i64 = conn
+        .query_row_map(&max_sql, fparams![], |row| row.get_typed(0))
+        .with_context(|| {
+            format!(
+                "reading maximum {}.{} key for orphan FK cleanup",
+                entry.child_table, entry.child_key_column
+            )
+        })?;
+
+    let exact_range_width = max_child_parent_id
+        .checked_sub(min_child_parent_id)
+        .and_then(|value| value.checked_add(1))
+        .unwrap_or(i64::MAX);
+    if exact_range_width <= ORPHAN_FK_EXACT_DIRECT_CHILD_RANGE_LIMIT {
+        return Ok(false);
+    }
+
+    record_step("parent_boundary_min");
+    if !parent_key_exists(
+        conn,
+        entry.parent_table,
+        entry.parent_id_column,
+        min_child_parent_id,
+    )? {
+        return Ok(false);
+    }
+    if max_child_parent_id == min_child_parent_id {
+        return Ok(true);
+    }
+
+    record_step("parent_boundary_max");
+    parent_key_exists(
+        conn,
+        entry.parent_table,
+        entry.parent_id_column,
+        max_child_parent_id,
+    )
+}
+
+fn parent_key_exists(
+    conn: &FrankenConnection,
+    parent_table: &'static str,
+    parent_id_column: &'static str,
+    parent_id: i64,
+) -> Result<bool> {
+    let sql = format!("SELECT 1 FROM {parent_table} WHERE {parent_id_column} = ?1 LIMIT 1");
+    let found = conn
+        .query_map_collect(&sql, fparams![parent_id], |row| row.get_typed::<i64>(0))
+        .with_context(|| {
+            format!(
+                "checking parent key {parent_table}.{parent_id_column}={parent_id} for orphan FK cleanup"
+            )
+        })?
+        .into_iter()
+        .next()
+        .is_some();
+    Ok(found)
 }
 
 fn delete_rows_by_i64_chunks(
@@ -5973,6 +6137,9 @@ fn delete_direct_orphan_id_chunk_once(
 /// yields the integer FK key used by the matching chunked delete.
 struct OrphanFkTable {
     child_table: &'static str,
+    child_key_column: &'static str,
+    parent_table: &'static str,
+    parent_id_column: &'static str,
     orphan_id_page_sql: &'static str,
     delete_many_sql_prefix: &'static str,
 }
@@ -5980,10 +6147,13 @@ struct OrphanFkTable {
 const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "message_metrics",
-        orphan_id_page_sql: "SELECT message_id FROM message_metrics \
-                             WHERE NOT EXISTS (\
-                                 SELECT 1 FROM messages \
-                                 WHERE messages.id = message_metrics.message_id\
+        child_key_column: "message_id",
+        parent_table: "messages",
+        parent_id_column: "id",
+        orphan_id_page_sql: "SELECT message_id FROM (\
+                                 SELECT message_id FROM message_metrics \
+                                 EXCEPT \
+                                 SELECT id FROM messages\
                              ) \
                              ORDER BY message_id \
                              LIMIT ?1",
@@ -5991,10 +6161,13 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     },
     OrphanFkTable {
         child_table: "token_usage",
-        orphan_id_page_sql: "SELECT message_id FROM token_usage \
-                             WHERE NOT EXISTS (\
-                                 SELECT 1 FROM messages \
-                                 WHERE messages.id = token_usage.message_id\
+        child_key_column: "message_id",
+        parent_table: "messages",
+        parent_id_column: "id",
+        orphan_id_page_sql: "SELECT message_id FROM (\
+                                 SELECT message_id FROM token_usage \
+                                 EXCEPT \
+                                 SELECT id FROM messages\
                              ) \
                              ORDER BY message_id \
                              LIMIT ?1",
@@ -6002,10 +6175,13 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     },
     OrphanFkTable {
         child_table: "snippets",
-        orphan_id_page_sql: "SELECT message_id FROM snippets \
-                             WHERE NOT EXISTS (\
-                                 SELECT 1 FROM messages \
-                                 WHERE messages.id = snippets.message_id\
+        child_key_column: "message_id",
+        parent_table: "messages",
+        parent_id_column: "id",
+        orphan_id_page_sql: "SELECT message_id FROM (\
+                                 SELECT message_id FROM snippets \
+                                 EXCEPT \
+                                 SELECT id FROM messages\
                              ) \
                              ORDER BY message_id \
                              LIMIT ?1",
@@ -6013,10 +6189,13 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     },
     OrphanFkTable {
         child_table: "conversation_tags",
-        orphan_id_page_sql: "SELECT conversation_id FROM conversation_tags \
-                             WHERE NOT EXISTS (\
-                                 SELECT 1 FROM conversations \
-                                 WHERE conversations.id = conversation_tags.conversation_id\
+        child_key_column: "conversation_id",
+        parent_table: "conversations",
+        parent_id_column: "id",
+        orphan_id_page_sql: "SELECT conversation_id FROM (\
+                                 SELECT conversation_id FROM conversation_tags \
+                                 EXCEPT \
+                                 SELECT id FROM conversations\
                              ) \
                              ORDER BY conversation_id \
                              LIMIT ?1",

@@ -11499,7 +11499,10 @@ pub fn run_index(
     // continuing after OOM/corruption can reuse a poisoned connection and make
     // the canonical archive worse.
     set_progress_preparation_step(opts.progress.as_ref(), "cleaning_orphan_fk_rows");
-    if let Err(err) = storage.cleanup_orphan_fk_rows() {
+    let progress_for_orphan_fk_cleanup = opts.progress.as_ref();
+    if let Err(err) = storage.cleanup_orphan_fk_rows_with_step(|step| {
+        set_progress_preparation_step(progress_for_orphan_fk_cleanup, step);
+    }) {
         tracing::warn!(
             target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
