@@ -41,7 +41,7 @@ This document describes performance characteristics, benchmarks, and optimizatio
 | Insert conversation | < 10ms | Per conversation | With 10-20 messages |
 | List conversations | < 50ms | 10K+ conversations | Paginated, 100 results |
 | Fetch messages | < 20ms | Per conversation | Up to 500 messages |
-| FTS rebuild | < 1s | 1K conversations | Full-text search index |
+| DB FTS fallback repair | Best-effort | Optional derived table | Must not block Tantivy lexical readiness |
 
 ### Export Operations
 
@@ -251,7 +251,29 @@ Full runtime benchmarks:
 
 1. **Use readonly mode**: Open databases read-only when not writing
 2. **Batch operations**: Group insertions for better throughput
-3. **Maintain indexes**: Run periodic FTS rebuilds if needed
+3. **Maintain derived indexes deliberately**: Tantivy lexical and semantic
+   artifacts are derived from SQLite and should rebuild through the normal
+   scratch/publish paths. DB-resident FTS is an optional fallback/repair
+   surface, not a required readiness gate.
+
+### Large-Corpus Startup Checks
+
+For archives in the 10K+ conversation / 500K+ message range, startup and TUI
+population paths are part of the performance contract:
+
+1. Empty-query Recent browse should read conversation tails through
+   `conversation_tail_state` and `idx_conversation_tail_state_last_created`.
+2. `list_conversations()` newest-first paging should use
+   `idx_conversations_started_recent` for non-null `started_at` rows, with a
+   bounded legacy null-start fallback.
+3. Avoid startup plans that sort `messages.created_at` globally. Migration V17
+   deliberately removed the broad `messages(created_at)` index to protect
+   ingest write amplification; adding it back should require a measured
+   tradeoff.
+4. Health and search robot metadata should agree on freshness/checkpoint state.
+   If `cass health --json` reports stale while `cass search --robot-meta`
+   reports a different checkpoint or timestamp, treat that as a readiness bug
+   before using CASS as a GUI smoke oracle.
 
 ### Cryptographic Performance
 

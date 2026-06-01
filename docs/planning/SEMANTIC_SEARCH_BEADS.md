@@ -4,6 +4,26 @@
 
 This document elaborates on the semantic search plan and defines the complete bead (task) hierarchy for implementation. It's designed to be self-contained so any developer can pick up the work.
 
+## Current Backfill Contract
+
+Status note 2026-06-01: semantic/vector indexing must support append-only
+backfill across canonical DB fingerprint changes. A changed DB fingerprint is
+not by itself a reason to discard a ready semantic artifact when the covered
+content is a prefix of the current archive. The expected behavior is:
+
+- reuse a ready artifact when its covered messages still match the current
+  append-only prefix;
+- append embeddings for new conversations and for new messages in already
+  covered conversations;
+- update the artifact DB fingerprint and document count after append success;
+- preserve truthful progress metadata such as `last_message_id`, quality tier
+  coverage, and pending-work state.
+
+This keeps semantic enrichment opportunistic and durable while lexical search
+remains available. If health/search metadata disagree about semantic readiness
+or freshness, that is a readiness/reporting bug to investigate separately from
+the append-only backfill algorithm.
+
 ## Design Review: Optimizations Applied
 
 ### Critical Fixes Applied During Review

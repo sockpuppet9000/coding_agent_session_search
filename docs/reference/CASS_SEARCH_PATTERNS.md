@@ -29,6 +29,28 @@ CASS uses a **multi-layered hybrid search architecture** combining lexical (BM25
 ### Tertiary: SQLite
 - **Role**: Fallback and metadata storage
 - **Features**: Connection pooling, schema management
+- **Contract**: SQLite is the authoritative archive, not the primary full-text
+  engine. DB-resident FTS tables such as `fts_messages` are optional derived
+  fallback metadata. Missing, malformed, or stale DB FTS must not make Tantivy
+  lexical search, health, indexing, or source maintenance unusable.
+
+### 2026-06 Large-Corpus Invariants
+
+The 2026-06 local large-corpus investigation split three failure classes that
+should stay separate in future work:
+
+1. **FTS optionality**: Tantivy/frankensearch owns normal lexical search. DB FTS
+   can be repaired or skipped best-effort, but canonical `messages` rows and
+   Tantivy artifacts are the truth surfaces for search readiness.
+2. **Semantic append/backfill across DB fingerprints**: semantic artifacts may
+   be reused when the canonical DB evolves append-only. Fingerprint changes
+   alone must not force throwing away ready vector coverage or prevent backfill
+   from appending new messages in existing conversations.
+3. **Startup/recent-list date queries**: TUI startup and fallback conversation
+   lists must use conversation-level indexed state. Empty-query Recent browse
+   uses `conversation_tail_state` and newest-first conversation paging uses
+   `idx_conversations_started_recent`; do not reintroduce a broad
+   `messages.created_at` sort on the startup path without measured justification.
 
 ---
 
@@ -592,4 +614,3 @@ Concurrent searches:  Multi-threaded Tokio runtime
 | Hybrid | RRF fusion | 100-1500ms | ~Both sizes | Best of both |
 | Caching | LRU Bloom filter | <5ms | Bounded | Interactive typing |
 | Dedupe | HashMap | <1ms | Minimal | Noise filtering |
-
