@@ -12766,9 +12766,9 @@ pub fn run_index(
         );
     }
 
-    reset_progress_to_idle(opts.progress.as_ref());
-
     if opts.watch || opts.watch_once_paths.is_some() {
+        reset_progress_to_idle(opts.progress.as_ref());
+
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
@@ -13091,6 +13091,10 @@ pub fn run_index(
         return Ok(());
     }
 
+    set_progress_preparation_step(
+        opts.progress.as_ref(),
+        "closing_index_storage_or_final_checkpoint",
+    );
     close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
