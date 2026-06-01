@@ -2600,6 +2600,20 @@ fn heartbeat_index_run_lock_with_lock_and_progress(
     metadata_write_lock: Option<&Arc<Mutex<()>>>,
     last_progress_at_ms: i64,
 ) -> Result<()> {
+    refresh_index_run_lock_metadata_with_progress(
+        data_dir,
+        metadata_write_lock,
+        last_progress_at_ms,
+        &[],
+    )
+}
+
+fn refresh_index_run_lock_metadata_with_progress(
+    data_dir: &Path,
+    metadata_write_lock: Option<&Arc<Mutex<()>>>,
+    last_progress_at_ms: i64,
+    extra_fields: &[(&str, String)],
+) -> Result<()> {
     let _write_guard = metadata_write_lock
         .map(|lock| {
             lock.lock()
@@ -2660,6 +2674,11 @@ fn heartbeat_index_run_lock_with_lock_and_progress(
 
     let mut wrote_updated_at = false;
     let mut wrote_progress = !should_advance_progress;
+    let extra_fields: BTreeMap<&str, &str> = extra_fields
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    let mut wrote_extra = BTreeSet::new();
     let mut refreshed = String::with_capacity(existing.len() + 64);
     for line in existing.lines() {
         if line.strip_prefix("updated_at_ms=").is_some() {
@@ -2674,6 +2693,14 @@ fn heartbeat_index_run_lock_with_lock_and_progress(
                 refreshed.push_str(line);
             }
             wrote_progress = true;
+        } else if let Some((key, _)) = line.split_once('=')
+            && let Some(value) = extra_fields.get(key.trim())
+        {
+            let key = key.trim();
+            refreshed.push_str(key);
+            refreshed.push('=');
+            refreshed.push_str(value);
+            wrote_extra.insert(key);
         } else {
             refreshed.push_str(line);
         }
@@ -2689,8 +2716,107 @@ fn heartbeat_index_run_lock_with_lock_and_progress(
         refreshed.push_str(progress_str);
         refreshed.push('\n');
     }
+    for (key, value) in extra_fields {
+        if wrote_extra.contains(key) {
+            continue;
+        }
+        refreshed.push_str(key);
+        refreshed.push('=');
+        refreshed.push_str(value);
+        refreshed.push('\n');
+    }
 
     write_index_run_lock_heartbeat_in_place(&lock_path, &refreshed)
+}
+
+fn sanitize_index_run_lock_value(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .chars()
+        .map(|ch| match ch {
+            '\n' | '\r' => ' ',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn sanitize_index_run_lock_key_fragment(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn record_index_run_scan_state(
+    data_dir: &Path,
+    metadata_write_lock: Option<&Arc<Mutex<()>>>,
+    progress_bump: Option<&Arc<AtomicI64>>,
+    connector: &str,
+    stage: &str,
+    scope: &str,
+    root: Option<&Path>,
+) {
+    let progress_at_ms = progress_bump
+        .map(bump_index_run_lock_progress_atomic)
+        .unwrap_or_else(FrankenStorage::now_millis);
+    let root_value = root
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let connector = sanitize_index_run_lock_value(connector);
+    let stage = sanitize_index_run_lock_value(stage);
+    let scope = sanitize_index_run_lock_value(scope);
+    let root_value = sanitize_index_run_lock_value(root_value);
+    let connector_key = sanitize_index_run_lock_key_fragment(&connector);
+    let mut per_connector_stage_key = String::from("scan_");
+    per_connector_stage_key.push_str(&connector_key);
+    per_connector_stage_key.push_str("_stage");
+    let mut per_connector_scope_key = String::from("scan_");
+    per_connector_scope_key.push_str(&connector_key);
+    per_connector_scope_key.push_str("_scope");
+    let mut per_connector_root_key = String::from("scan_");
+    per_connector_root_key.push_str(&connector_key);
+    per_connector_root_key.push_str("_root");
+    let mut per_connector_updated_key = String::from("scan_");
+    per_connector_updated_key.push_str(&connector_key);
+    per_connector_updated_key.push_str("_updated_at_ms");
+    let progress_at_ms_string = progress_at_ms.to_string();
+    let extra_fields = [
+        ("scan_connector", connector.clone()),
+        ("scan_stage", stage.clone()),
+        ("scan_scope", scope.clone()),
+        ("scan_root", root_value.clone()),
+        ("scan_updated_at_ms", progress_at_ms_string.clone()),
+        (per_connector_stage_key.as_str(), stage.clone()),
+        (per_connector_scope_key.as_str(), scope.clone()),
+        (per_connector_root_key.as_str(), root_value),
+        (per_connector_updated_key.as_str(), progress_at_ms_string),
+    ];
+    if let Err(err) = refresh_index_run_lock_metadata_with_progress(
+        data_dir,
+        metadata_write_lock,
+        progress_at_ms,
+        &extra_fields,
+    ) {
+        tracing::debug!(
+            connector,
+            stage,
+            scope,
+            error = %err,
+            "failed to record index-run scan stage"
+        );
+    }
 }
 
 fn write_index_run_lock_heartbeat_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
@@ -10235,6 +10361,8 @@ struct StreamingProducerConfig {
     since_ts: Option<i64>,
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
+    index_run_progress_bump: Option<Arc<AtomicI64>>,
+    index_run_metadata_write_lock: Option<Arc<Mutex<()>>>,
 }
 
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
@@ -10251,8 +10379,37 @@ fn spawn_connector_producer(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
+        let metadata_write_lock = config.index_run_metadata_write_lock.as_ref();
+        let progress_bump = config.index_run_progress_bump.as_ref();
+        record_index_run_scan_state(
+            &config.data_dir,
+            metadata_write_lock,
+            progress_bump,
+            name,
+            "producer_start",
+            "connector",
+            None,
+        );
+        record_index_run_scan_state(
+            &config.data_dir,
+            metadata_write_lock,
+            progress_bump,
+            name,
+            "detect_start",
+            "connector",
+            None,
+        );
         let conn = factory();
         let detect = conn.detect();
+        record_index_run_scan_state(
+            &config.data_dir,
+            metadata_write_lock,
+            progress_bump,
+            name,
+            "detect_done",
+            "connector",
+            None,
+        );
         let was_detected = detect.detected;
         let mut is_discovered = false;
 
@@ -10277,6 +10434,15 @@ fn spawn_connector_producer(
                 .cloned()
                 .map(ScanRoot::local)
                 .collect();
+            record_index_run_scan_state(
+                &config.data_dir,
+                metadata_write_lock,
+                progress_bump,
+                name,
+                "local_capture_sources",
+                "local",
+                None,
+            );
             capture_connector_sources_before_parse(
                 conn.as_ref(),
                 &ctx,
@@ -10286,7 +10452,17 @@ fn spawn_connector_producer(
                 config.since_ts,
                 config.active_source_filter.as_ref(),
             );
+            record_index_run_scan_state(
+                &config.data_dir,
+                metadata_write_lock,
+                progress_bump,
+                name,
+                "local_scan",
+                "local",
+                None,
+            );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                bump_index_run_lock_progress_if_present(progress_bump);
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     LOCAL_SOURCE_ID,
@@ -10300,6 +10476,15 @@ fn spawn_connector_producer(
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        "local_flush",
+                        "local",
+                        None,
+                    );
                     if let Err(error) = batch_sender.flush() {
                         if is_streaming_consumer_disconnected(&error) {
                             tracing::info!(
@@ -10313,9 +10498,28 @@ fn spawn_connector_producer(
                             connector_name: name,
                             error: format!("local flush failed: {error}"),
                         });
+                    } else {
+                        record_index_run_scan_state(
+                            &config.data_dir,
+                            metadata_write_lock,
+                            progress_bump,
+                            name,
+                            "local_done",
+                            "local",
+                            None,
+                        );
                     }
                 }
                 Err(e) => {
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        "local_error",
+                        "local",
+                        None,
+                    );
                     if let Err(flush_error) = batch_sender.flush()
                         && !is_streaming_consumer_disconnected(&flush_error)
                     {
@@ -10347,6 +10551,15 @@ fn spawn_connector_producer(
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
+            record_index_run_scan_state(
+                &config.data_dir,
+                metadata_write_lock,
+                progress_bump,
+                name,
+                "configured_capture_sources",
+                "configured",
+                Some(&root.path),
+            );
             capture_connector_sources_before_parse(
                 conn.as_ref(),
                 &ctx,
@@ -10356,7 +10569,17 @@ fn spawn_connector_producer(
                 config.since_ts,
                 config.active_source_filter.as_ref(),
             );
+            record_index_run_scan_state(
+                &config.data_dir,
+                metadata_write_lock,
+                progress_bump,
+                name,
+                "configured_scan",
+                "configured",
+                Some(&root.path),
+            );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                bump_index_run_lock_progress_if_present(progress_bump);
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     &root.origin.source_id,
@@ -10380,6 +10603,15 @@ fn spawn_connector_producer(
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        "configured_flush",
+                        "configured",
+                        Some(&root.path),
+                    );
                     if let Err(error) = batch_sender.flush() {
                         if is_streaming_consumer_disconnected(&error) {
                             tracing::info!(
@@ -10402,9 +10634,28 @@ fn spawn_connector_producer(
                                 error
                             ),
                         });
+                    } else {
+                        record_index_run_scan_state(
+                            &config.data_dir,
+                            metadata_write_lock,
+                            progress_bump,
+                            name,
+                            "configured_done",
+                            "configured",
+                            Some(&root.path),
+                        );
                     }
                 }
                 Err(e) => {
+                    record_index_run_scan_state(
+                        &config.data_dir,
+                        metadata_write_lock,
+                        progress_bump,
+                        name,
+                        "configured_error",
+                        "configured",
+                        Some(&root.path),
+                    );
                     if let Err(flush_error) = batch_sender.flush()
                         && !is_streaming_consumer_disconnected(&flush_error)
                     {
@@ -10441,6 +10692,15 @@ fn spawn_connector_producer(
             discovered = is_discovered,
             scan_ms,
             "streaming_scan_complete"
+        );
+        record_index_run_scan_state(
+            &config.data_dir,
+            metadata_write_lock,
+            progress_bump,
+            name,
+            "producer_done",
+            "connector",
+            None,
         );
 
         // Signal completion with timing
@@ -10886,6 +11146,8 @@ fn run_streaming_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
+    index_run_progress_bump: Option<Arc<AtomicI64>>,
+    index_run_metadata_write_lock: Option<Arc<Mutex<()>>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_streaming_index_with_connector_factories(
         storage,
@@ -10896,6 +11158,8 @@ fn run_streaming_index(
         additional_scan_roots,
         configured_connector_factories(),
         scan_start_ts,
+        index_run_progress_bump,
+        index_run_metadata_write_lock,
     )
 }
 
@@ -10952,6 +11216,8 @@ fn run_streaming_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
+    index_run_progress_bump: Option<Arc<AtomicI64>>,
+    index_run_metadata_write_lock: Option<Arc<Mutex<()>>>,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
@@ -11005,6 +11271,8 @@ fn run_streaming_index_with_connector_factories(
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
         )),
+        index_run_progress_bump,
+        index_run_metadata_write_lock,
     };
 
     // Spawn producer threads for each connector
@@ -12368,6 +12636,8 @@ pub fn run_index(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         scan_start_ts,
+                        Some(Arc::clone(&progress_bump)),
+                        Some(Arc::clone(&index_run_lock.metadata_write_lock)),
                     )?;
                     // F4 (cass tech debt): a completed scan is a real
                     // forward-progress boundary; bump the atomic so the
@@ -27142,6 +27412,82 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_preserves_scan_stage_metadata_fields() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("index-run.lock");
+        std::fs::write(
+            &lock_path,
+            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\nlast_progress_at_ms=333\ndb_path=/tmp/db.sqlite\nmode=index\njob_id=lexical_refresh-123\njob_kind=lexical_refresh\nphase=index\nscan_connector=chatgpt\nscan_stage=local_scan\nscan_scope=local\nscan_root=\nscan_updated_at_ms=444\nscan_chatgpt_stage=local_scan\nscan_chatgpt_scope=local\nscan_chatgpt_root=\nscan_chatgpt_updated_at_ms=444\n",
+        )
+        .unwrap();
+
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+
+        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        for expected in [
+            "scan_connector=chatgpt",
+            "scan_stage=local_scan",
+            "scan_scope=local",
+            "scan_root=",
+            "scan_updated_at_ms=444",
+            "scan_chatgpt_stage=local_scan",
+            "scan_chatgpt_scope=local",
+            "scan_chatgpt_root=",
+            "scan_chatgpt_updated_at_ms=444",
+        ] {
+            assert!(
+                refreshed.lines().any(|line| line == expected),
+                "heartbeat must preserve scan-stage metadata {expected:?}, got {refreshed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_index_run_scan_state_updates_lock_metadata_and_progress() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+        std::thread::sleep(Duration::from_millis(2));
+
+        record_index_run_scan_state(
+            tmp.path(),
+            Some(&guard.metadata_write_lock),
+            Some(&guard.last_progress_at_ms_atomic),
+            "chatgpt",
+            "local_scan",
+            "local",
+            None,
+        );
+
+        let lock_path = tmp.path().join("index-run.lock");
+        let refreshed = std::fs::read_to_string(&lock_path)?;
+        for expected in [
+            "scan_connector=chatgpt",
+            "scan_stage=local_scan",
+            "scan_scope=local",
+            "scan_chatgpt_stage=local_scan",
+            "scan_chatgpt_scope=local",
+        ] {
+            assert!(
+                refreshed.lines().any(|line| line == expected),
+                "scan-stage metadata line {expected:?} missing from {refreshed:?}"
+            );
+        }
+        let snapshot = crate::search::asset_state::read_search_maintenance_snapshot(tmp.path());
+        assert_eq!(snapshot.scan_connector.as_deref(), Some("chatgpt"));
+        assert_eq!(snapshot.scan_stage.as_deref(), Some("local_scan"));
+        assert_eq!(snapshot.scan_scope.as_deref(), Some("local"));
+        assert!(
+            snapshot.scan_updated_at_ms.is_some(),
+            "snapshot should surface scan_updated_at_ms from lock metadata"
+        );
+        drop(guard);
+        Ok(())
+    }
+
+    #[test]
     fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
@@ -34268,6 +34614,8 @@ mod tests {
                 since_ts: None,
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+                index_run_progress_bump: None,
+                index_run_metadata_write_lock: None,
             },
         );
 
@@ -34334,6 +34682,8 @@ mod tests {
             Vec::new(),
             vec![("claude", panic_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
+            None,
         )
         .expect_err("producer panic should abort streaming indexing");
         let message = error.to_string();
@@ -34450,6 +34800,8 @@ mod tests {
                 since_ts: None,
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+                index_run_progress_bump: None,
+                index_run_metadata_write_lock: None,
             },
         );
 

@@ -111,6 +111,11 @@ pub(crate) struct SearchMaintenanceSnapshot {
     pub phase: Option<String>,
     pub updated_at_ms: Option<i64>,
     pub last_progress_at_ms: Option<i64>,
+    pub scan_connector: Option<String>,
+    pub scan_stage: Option<String>,
+    pub scan_scope: Option<String>,
+    pub scan_root: Option<String>,
+    pub scan_updated_at_ms: Option<i64>,
     pub orphaned: bool,
 }
 
@@ -244,7 +249,12 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         || snapshot.job_kind.is_some()
         || snapshot.phase.is_some()
         || snapshot.updated_at_ms.is_some()
-        || snapshot.last_progress_at_ms.is_some();
+        || snapshot.last_progress_at_ms.is_some()
+        || snapshot.scan_connector.is_some()
+        || snapshot.scan_stage.is_some()
+        || snapshot.scan_scope.is_some()
+        || snapshot.scan_root.is_some()
+        || snapshot.scan_updated_at_ms.is_some();
 
     #[cfg(windows)]
     let current_process_owns_recorded_lock =
@@ -324,6 +334,11 @@ fn parse_search_maintenance_snapshot(
     let mut phase = None;
     let mut updated_at_ms = None;
     let mut last_progress_at_ms = None;
+    let mut scan_connector = None;
+    let mut scan_stage = None;
+    let mut scan_scope = None;
+    let mut scan_root = None;
+    let mut scan_updated_at_ms = None;
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -338,6 +353,19 @@ fn parse_search_maintenance_snapshot(
             "phase" => phase = Some(value.trim().to_string()).filter(|value| !value.is_empty()),
             "updated_at_ms" => updated_at_ms = value.trim().parse::<i64>().ok(),
             "last_progress_at_ms" => last_progress_at_ms = value.trim().parse::<i64>().ok(),
+            "scan_connector" => {
+                scan_connector = Some(value.trim().to_string()).filter(|value| !value.is_empty())
+            }
+            "scan_stage" => {
+                scan_stage = Some(value.trim().to_string()).filter(|value| !value.is_empty())
+            }
+            "scan_scope" => {
+                scan_scope = Some(value.trim().to_string()).filter(|value| !value.is_empty())
+            }
+            "scan_root" => {
+                scan_root = Some(value.trim().to_string()).filter(|value| !value.is_empty())
+            }
+            "scan_updated_at_ms" => scan_updated_at_ms = value.trim().parse::<i64>().ok(),
             _ => {}
         }
     }
@@ -350,7 +378,12 @@ fn parse_search_maintenance_snapshot(
         || job_kind.is_some()
         || phase.is_some()
         || updated_at_ms.is_some()
-        || last_progress_at_ms.is_some();
+        || last_progress_at_ms.is_some()
+        || scan_connector.is_some()
+        || scan_stage.is_some()
+        || scan_scope.is_some()
+        || scan_root.is_some()
+        || scan_updated_at_ms.is_some();
 
     SearchMaintenanceSnapshot {
         active: active_when_metadata_unreadable,
@@ -363,6 +396,11 @@ fn parse_search_maintenance_snapshot(
         phase,
         updated_at_ms,
         last_progress_at_ms,
+        scan_connector,
+        scan_stage,
+        scan_scope,
+        scan_root,
+        scan_updated_at_ms,
         orphaned: metadata_present && !active_when_metadata_unreadable,
     }
 }
@@ -2513,6 +2551,11 @@ mod tests {
                 phase: None,
                 updated_at_ms: None,
                 last_progress_at_ms: None,
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2623,6 +2666,11 @@ mod tests {
                 phase: None,
                 updated_at_ms: Some(1_733_000_456_000),
                 last_progress_at_ms: None,
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2675,6 +2723,11 @@ mod tests {
                 phase: None,
                 updated_at_ms: None,
                 last_progress_at_ms: None,
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2727,6 +2780,11 @@ mod tests {
                 phase: None,
                 updated_at_ms: None,
                 last_progress_at_ms: None,
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2782,6 +2840,11 @@ mod tests {
                 phase: Some("watch_startup".to_string()),
                 updated_at_ms: Some(now_ms - 500),
                 last_progress_at_ms: Some(now_ms - 300_000),
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2851,6 +2914,11 @@ mod tests {
                 phase: Some("scanning".to_string()),
                 updated_at_ms: Some(now_ms - 500),
                 last_progress_at_ms: Some(now_ms - 1_000),
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2897,6 +2965,11 @@ mod tests {
                 phase: None,
                 updated_at_ms: Some(now_ms - 500),
                 last_progress_at_ms: None,
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2951,6 +3024,11 @@ mod tests {
                 phase: Some("watch_startup".to_string()),
                 updated_at_ms: Some(now_ms - 500),
                 last_progress_at_ms: Some(last_progress_at_ms),
+                scan_connector: None,
+                scan_stage: None,
+                scan_scope: None,
+                scan_root: None,
+                scan_updated_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2994,6 +3072,11 @@ mod tests {
             phase: Some("watch_startup".to_string()),
             updated_at_ms: Some(now_ms - 500),
             last_progress_at_ms: Some(now_ms - 300_000),
+            scan_connector: None,
+            scan_stage: None,
+            scan_scope: None,
+            scan_root: None,
+            scan_updated_at_ms: None,
             orphaned: false,
         };
 
@@ -3479,8 +3562,29 @@ mod tests {
             phase: Some("scanning".to_string()),
             updated_at_ms: Some(now_ms - 500),
             last_progress_at_ms: Some(now_ms - 500),
+            scan_connector: None,
+            scan_stage: None,
+            scan_scope: None,
+            scan_root: None,
+            scan_updated_at_ms: None,
             orphaned: false,
         }
+    }
+
+    #[test]
+    fn parse_search_maintenance_snapshot_surfaces_scan_stage_fields() {
+        let snapshot = parse_search_maintenance_snapshot(
+            "pid=12345\nstarted_at_ms=1733000000000\ndb_path=/tmp/cass/agent_search.db\nmode=index\njob_id=lexical_refresh-1-12345\njob_kind=lexical_refresh\nphase=index\nupdated_at_ms=1733000000500\nlast_progress_at_ms=1733000000400\nscan_connector=chatgpt\nscan_stage=local_scan\nscan_scope=local\nscan_root=/tmp/chatgpt\nscan_updated_at_ms=1733000000450\n".to_string(),
+            true,
+        );
+
+        assert_eq!(snapshot.scan_connector.as_deref(), Some("chatgpt"));
+        assert_eq!(snapshot.scan_stage.as_deref(), Some("local_scan"));
+        assert_eq!(snapshot.scan_scope.as_deref(), Some("local"));
+        assert_eq!(snapshot.scan_root.as_deref(), Some("/tmp/chatgpt"));
+        assert_eq!(snapshot.scan_updated_at_ms, Some(1_733_000_000_450));
+        assert!(snapshot.active);
+        assert!(!snapshot.orphaned);
     }
 
     #[test]
