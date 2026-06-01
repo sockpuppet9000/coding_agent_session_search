@@ -89,11 +89,6 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         .iter()
         .flat_map(modern_codex_message_call_ids)
         .collect();
-    let mut seen_raw_entries: HashSet<[u8; 32]> = conversation
-        .messages
-        .iter()
-        .map(|message| modern_codex_raw_signature(&message.extra))
-        .collect();
     let mut added = false;
     for (line_no_zero, line) in BufReader::new(file)
         .lines()
@@ -103,6 +98,9 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         let line_no = line_no_zero + 1;
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if !line_may_contain_modern_codex_augmented_message(line) {
             continue;
         }
         let raw = match serde_json::from_str::<Value>(line) {
@@ -121,20 +119,14 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
                 continue;
             }
         };
-        let raw_signature = modern_codex_raw_signature(&raw);
-        if seen_raw_entries.contains(&raw_signature) {
-            continue;
-        }
         let Some(message) = modern_codex_message(&raw) else {
             continue;
         };
         if message_already_indexed(&seen_messages, &seen_call_ids, &message) {
-            seen_raw_entries.insert(raw_signature);
             continue;
         }
         seen_messages.insert(modern_codex_message_signature(&message));
         seen_call_ids.extend(modern_codex_message_call_ids(&message));
-        seen_raw_entries.insert(raw_signature);
         conversation.messages.push(message);
         added = true;
     }
@@ -147,6 +139,17 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         });
         reindex_messages(&mut conversation.messages);
     }
+}
+
+fn line_may_contain_modern_codex_augmented_message(line: &str) -> bool {
+    [
+        "\"function_call\"",
+        "\"function_call_output\"",
+        "\"agent_message\"",
+        "\"tool_result\"",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
 }
 
 fn modern_codex_message(raw: &Value) -> Option<NormalizedMessage> {
@@ -436,14 +439,6 @@ fn modern_codex_message_signature(message: &NormalizedMessage) -> ModernCodexMes
     }
 }
 
-fn modern_codex_raw_signature(raw: &Value) -> [u8; 32] {
-    let mut bytes = Vec::new();
-    if serde_json::to_writer(&mut bytes, raw).is_err() {
-        bytes.extend_from_slice(raw.to_string().as_bytes());
-    }
-    *blake3::hash(&bytes).as_bytes()
-}
-
 fn modern_codex_message_call_ids(message: &NormalizedMessage) -> impl Iterator<Item = String> + '_ {
     message
         .invocations
@@ -467,6 +462,7 @@ fn message_already_indexed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn message(content: &str, call_id: Option<&str>) -> NormalizedMessage {
         NormalizedMessage {
@@ -521,5 +517,80 @@ mod tests {
             &seen_call_ids,
             &fresh
         ));
+    }
+
+    #[test]
+    fn codex_augmentation_line_filter_targets_only_cass_extra_event_types() {
+        assert!(line_may_contain_modern_codex_augmented_message(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell"}}"#
+        ));
+        assert!(line_may_contain_modern_codex_augmented_message(
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}"#
+        ));
+        assert!(line_may_contain_modern_codex_augmented_message(
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#
+        ));
+        assert!(line_may_contain_modern_codex_augmented_message(
+            r#"{"type":"event_msg","payload":{"type":"tool_result","output":"done"}}"#
+        ));
+        assert!(!line_may_contain_modern_codex_augmented_message(
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#
+        ));
+        assert!(!line_may_contain_modern_codex_augmented_message(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#
+        ));
+    }
+
+    #[test]
+    fn augment_modern_codex_messages_adds_function_call_output_from_filtered_pass() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_path = temp.path().join("rollout-test.jsonl");
+        std::fs::write(
+            &source_path,
+            [
+                r#"{"type":"event_msg","timestamp":"2026-06-01T12:00:00Z","payload":{"type":"user_message","message":"already handled by FAD"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-06-01T12:00:01Z","payload":{"type":"function_call","name":"shell","call_id":"call-42","arguments":"{\"cmd\":\"date\"}"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-06-01T12:00:02Z","payload":{"type":"function_call_output","call_id":"call-42","output":"Mon Jun 1"}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write rollout");
+
+        let mut conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("test".to_string()),
+            title: None,
+            workspace: None,
+            source_path,
+            started_at: None,
+            ended_at: None,
+            metadata: Value::Null,
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(1_780_000_000_000),
+                content: "already handled by FAD".to_string(),
+                extra: Value::Null,
+                invocations: Vec::new(),
+                snippets: Vec::new(),
+            }],
+        };
+
+        augment_modern_codex_messages(&mut conversation);
+
+        assert_eq!(conversation.messages.len(), 3);
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.content.contains("[Tool: shell]"))
+        );
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.content.contains("[Tool output: call-42]"))
+        );
     }
 }
