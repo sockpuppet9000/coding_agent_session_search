@@ -9949,6 +9949,28 @@ impl StreamingByteLimiter {
             .map(|(reservation, _, _)| reservation)
     }
 
+    fn try_acquire(&self, requested_bytes: usize) -> Result<Option<usize>> {
+        if requested_bytes == 0 {
+            return Ok(Some(0));
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(anyhow::anyhow!(
+                "streaming byte limiter closed while waiting for capacity"
+            ));
+        }
+
+        let max_bytes_in_flight = self.max_bytes_in_flight.load(Ordering::Acquire).max(1);
+        let reservation = requested_bytes.min(max_bytes_in_flight);
+        if state.bytes_in_flight.saturating_add(reservation) <= max_bytes_in_flight {
+            state.bytes_in_flight += reservation;
+            Ok(Some(reservation))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn acquire_with_wait(&self, requested_bytes: usize) -> Result<(usize, Duration, bool)> {
         if requested_bytes == 0 {
             return Ok((0, Duration::ZERO, false));
@@ -9996,6 +10018,16 @@ impl StreamingByteLimiter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .bytes_in_flight
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        let bytes_in_flight = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes_in_flight;
+        let max_bytes_in_flight = self.max_bytes_in_flight.load(Ordering::Acquire);
+        (bytes_in_flight, max_bytes_in_flight)
     }
 
     fn update_max_bytes_in_flight(&self, max_bytes_in_flight: usize) {
@@ -10207,11 +10239,43 @@ impl<'a> StreamingBatchSender<'a> {
         }
 
         record_current_connector_scan_detail_stage("streaming_batch_acquire_start");
-        let byte_reservation = self.flow_limiter.acquire(char_count).map_err(|_| {
-            anyhow::Error::new(StreamingConsumerDisconnected {
-                connector_name: self.connector_name,
-            })
-        })?;
+        let byte_reservation = match self.flow_limiter.try_acquire(char_count) {
+            Ok(Some(byte_reservation)) => byte_reservation,
+            Ok(None) if !self.conversations.is_empty() => {
+                record_current_connector_scan_detail_stage(
+                    "streaming_batch_acquire_pending_flush_start",
+                );
+                self.flush()?;
+                record_current_connector_scan_detail_stage(
+                    "streaming_batch_acquire_pending_flush_done",
+                );
+                let (bytes_in_flight, max_bytes_in_flight) = self.flow_limiter.snapshot();
+                record_current_connector_scan_detail_stage_string(format!(
+                    "streaming_batch_acquire_waiting_after_pending_flush_request_{char_count}_inflight_{bytes_in_flight}_max_{max_bytes_in_flight}"
+                ));
+                self.flow_limiter.acquire(char_count).map_err(|_| {
+                    anyhow::Error::new(StreamingConsumerDisconnected {
+                        connector_name: self.connector_name,
+                    })
+                })?
+            }
+            Ok(None) => {
+                let (bytes_in_flight, max_bytes_in_flight) = self.flow_limiter.snapshot();
+                record_current_connector_scan_detail_stage_string(format!(
+                    "streaming_batch_acquire_waiting_empty_pending_request_{char_count}_inflight_{bytes_in_flight}_max_{max_bytes_in_flight}"
+                ));
+                self.flow_limiter.acquire(char_count).map_err(|_| {
+                    anyhow::Error::new(StreamingConsumerDisconnected {
+                        connector_name: self.connector_name,
+                    })
+                })?
+            }
+            Err(_) => {
+                return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                    connector_name: self.connector_name,
+                }));
+            }
+        };
         record_current_connector_scan_detail_stage("streaming_batch_acquire_done");
         self.message_count += message_count;
         self.char_count += char_count;
@@ -10467,7 +10531,7 @@ fn push_connector_scan_telemetry_context(
     ConnectorScanTelemetryGuard
 }
 
-pub(crate) fn record_current_connector_scan_detail_stage(stage: &'static str) {
+fn record_current_connector_scan_detail_stage_value(stage: &str) {
     let context =
         CONNECTOR_SCAN_TELEMETRY_CONTEXTS.with(|contexts| contexts.borrow().last().cloned());
     let Some(context) = context else {
@@ -10482,6 +10546,14 @@ pub(crate) fn record_current_connector_scan_detail_stage(stage: &'static str) {
         context.scope,
         context.root.as_deref(),
     );
+}
+
+pub(crate) fn record_current_connector_scan_detail_stage(stage: &'static str) {
+    record_current_connector_scan_detail_stage_value(stage);
+}
+
+fn record_current_connector_scan_detail_stage_string(stage: String) {
+    record_current_connector_scan_detail_stage_value(&stage);
 }
 
 fn codex_local_explicit_primary_file_roots(
@@ -11079,6 +11151,8 @@ fn run_streaming_consumer(
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     scan_start_ts: Option<i64>,
+    index_run_progress_bump: Option<Arc<AtomicI64>>,
+    index_run_metadata_write_lock: Option<Arc<Mutex<()>>>,
 ) -> Result<(Vec<String>, NonWatchIngestOutcome)> {
     use std::collections::HashMap;
 
@@ -11117,12 +11191,39 @@ fn run_streaming_consumer(
     let max_combine_messages = streaming_combine_max_messages();
     let max_combine_bytes = streaming_combine_max_bytes();
     let mut deferred_non_batch: VecDeque<IndexMessage> = VecDeque::new();
+    let consumer_stage_telemetry_enabled = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS").is_ok()
+        || dotenvy::var("CASS_STREAMING_CONSUMER_STAGE_TELEMETRY").is_ok();
+    let metadata_write_lock = index_run_metadata_write_lock.as_ref();
+    let progress_bump = index_run_progress_bump.as_ref();
+    let record_consumer_stage = |stage: &str| {
+        if consumer_stage_telemetry_enabled {
+            record_index_run_scan_state(
+                data_dir,
+                metadata_write_lock,
+                progress_bump,
+                "consumer",
+                stage,
+                "streaming",
+                None,
+            );
+        }
+    };
+    let record_consumer_limiter_stage = |stage_prefix: &str| {
+        if consumer_stage_telemetry_enabled {
+            let (bytes_in_flight, max_bytes_in_flight) = flow_limiter.snapshot();
+            let stage =
+                format!("{stage_prefix}_inflight_{bytes_in_flight}_max_{max_bytes_in_flight}");
+            record_consumer_stage(&stage);
+        }
+    };
+    record_consumer_stage("consumer_start");
 
     loop {
         // Drain any deferred messages from a prior combine-drain first, in
         // the exact order they arrived on the channel. This preserves the
         // invariant that every message is handled exactly once, in order,
         // regardless of whether combining was active.
+        record_consumer_limiter_stage("consumer_waiting_for_message");
         let next_message = if let Some(m) = deferred_non_batch.pop_front() {
             Ok(m)
         } else {
@@ -11136,6 +11237,7 @@ fn run_streaming_consumer(
                 message_count,
                 byte_reservation,
             }) => {
+                record_consumer_stage("consumer_batch_received");
                 // Accumulators start with the first-received batch.
                 let mut combined_conversations: Vec<NormalizedConversation> = conversations;
                 let mut combined_message_count = message_count;
@@ -11185,6 +11287,7 @@ fn run_streaming_consumer(
                 //   - non-Batch message (defer it for the next loop iteration),
                 //   - MAX messages or MAX bytes cap reached.
                 if combine_enabled && active_producers > 1 {
+                    record_consumer_stage("consumer_combine_start");
                     let mut combined_messages_so_far = 1usize;
                     while combined_messages_so_far < max_combine_messages
                         && combined_byte_reservation < max_combine_bytes
@@ -11232,10 +11335,12 @@ fn run_streaming_consumer(
                             Err(_) => break,
                         }
                     }
+                    record_consumer_stage("consumer_combine_done");
                 }
 
                 // Ingest the combined batch (== original single batch when
                 // combine_enabled = false or no extras were drained).
+                record_consumer_limiter_stage("consumer_ingest_start");
                 let batch_outcome = ingest_non_watch_batch_with_oom_split(
                     storage,
                     t_index.as_deref_mut(),
@@ -11245,8 +11350,23 @@ fn run_streaming_consumer(
                     lexical_strategy,
                     defer_streaming_checkpoints,
                 );
+                let batch_outcome = match batch_outcome {
+                    Ok(batch_outcome) => {
+                        record_consumer_limiter_stage("consumer_ingest_done");
+                        batch_outcome
+                    }
+                    Err(error) => {
+                        record_consumer_limiter_stage("consumer_ingest_error");
+                        record_consumer_limiter_stage("consumer_release_start");
+                        flow_limiter.release(combined_byte_reservation);
+                        record_consumer_limiter_stage("consumer_release_done");
+                        return Err(error);
+                    }
+                };
+                record_consumer_limiter_stage("consumer_release_start");
                 flow_limiter.release(combined_byte_reservation);
-                ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
+                record_consumer_limiter_stage("consumer_release_done");
+                ingest_outcome = ingest_outcome.accumulate(batch_outcome);
 
                 // For tracing parity with the per-message path, use the
                 // first batch's connector_name + the combined totals.
@@ -11578,6 +11698,8 @@ fn run_streaming_index_with_connector_factories(
         &opts.progress,
         lexical_strategy,
         Some(scan_start_ts),
+        producer_config.index_run_progress_bump.clone(),
+        producer_config.index_run_metadata_write_lock.clone(),
     );
 
     if consumer_result.is_err() {
@@ -33277,6 +33399,78 @@ mod tests {
     }
 
     #[test]
+    fn streaming_batch_sender_flushes_pending_batch_before_blocking_on_capacity() {
+        let (tx, rx) = bounded(2);
+        let limiter = Arc::new(StreamingByteLimiter::new(100));
+        let producer_limiter = Arc::clone(&limiter);
+
+        let producer = thread::spawn(move || -> Result<()> {
+            let mut sender = StreamingBatchSender::new(&tx, producer_limiter, "codex", true);
+            for external_id in ["first", "second"] {
+                sender.push(norm_conv(
+                    Some(external_id),
+                    vec![NormalizedMessage {
+                        content: "x".repeat(60),
+                        ..norm_msg(0, 1_000)
+                    }],
+                ))?;
+            }
+            sender.flush()
+        });
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pending batch should be flushed before waiting for more byte capacity");
+        match first {
+            IndexMessage::Batch {
+                conversations,
+                byte_reservation,
+                ..
+            } => {
+                assert_eq!(conversations.len(), 1);
+                assert_eq!(conversations[0].external_id.as_deref(), Some("first"));
+                assert_eq!(byte_reservation, 60);
+                assert_eq!(
+                    limiter.bytes_in_flight(),
+                    60,
+                    "producer should be blocked on the second reservation until the consumer releases the first"
+                );
+                limiter.release(byte_reservation);
+            }
+            other => panic!(
+                "expected first pending batch before capacity wait, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        let second = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer should acquire capacity after the first batch is released");
+        match second {
+            IndexMessage::Batch {
+                conversations,
+                byte_reservation,
+                ..
+            } => {
+                assert_eq!(conversations.len(), 1);
+                assert_eq!(conversations[0].external_id.as_deref(), Some("second"));
+                assert_eq!(byte_reservation, 60);
+                limiter.release(byte_reservation);
+            }
+            other => panic!(
+                "expected second batch after capacity release, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        producer
+            .join()
+            .expect("producer thread should not panic")
+            .expect("producer should finish after capacity is released");
+        assert_eq!(limiter.bytes_in_flight(), 0);
+    }
+
+    #[test]
     fn streaming_batch_sender_drop_releases_unflushed_reservation() {
         let (tx, rx) = bounded(2);
         let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
@@ -33958,6 +34152,8 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -34006,6 +34202,8 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
+            None,
+            None,
         )
         .expect("deferred streaming ingest should not require a Tantivy writer");
 
@@ -34073,6 +34271,8 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             Some(FrankenStorage::now_millis()),
+            None,
+            None,
         )
         .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
 
@@ -34129,6 +34329,8 @@ mod tests {
                 &Some(progress.clone()),
                 LexicalPopulationStrategy::IncrementalInline,
                 Some(FrankenStorage::now_millis()),
+                None,
+                None,
             )
             .expect("single deferred ingest OOM should quarantine and continue");
 
@@ -34476,6 +34678,8 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
+            None,
+            None,
         )
         .expect("mixed startup ingest should not violate foreign keys");
 
@@ -34714,6 +34918,8 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -34818,6 +35024,8 @@ mod tests {
                 &Some(progress),
                 LexicalPopulationStrategy::IncrementalInline,
                 None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -34896,6 +35104,8 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(discovered, vec!["codex".to_string()]);
@@ -34941,6 +35151,8 @@ mod tests {
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -35080,6 +35292,8 @@ mod tests {
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -35323,6 +35537,8 @@ mod tests {
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
+            None,
+            None,
             None,
         )
         .unwrap();
