@@ -210,18 +210,42 @@ fn list_dir_bounded(root: &Path, limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn quick_success_command() -> Command {
+        let mut cmd = Command::new("rustc");
+        cmd.arg("--version");
+        cmd
+    }
+
+    fn long_running_command() -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("/bin/sleep");
+            cmd.arg("30");
+            cmd
+        }
+    }
+
     /// Proves the happy path: a fast-exiting child returns Output
     /// normally with no panic and no diagnostic noise.
     #[test]
     fn happy_path_returns_output_without_panicking() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("printf 'hi' && exit 0");
+        let cmd = quick_success_command();
         let out = spawn_with_timeout_or_diag(cmd, "happy_path", None, Duration::from_secs(5));
-        assert!(out.status.success(), "shell must exit 0");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "hi",
-            "stdout must round-trip"
+        assert!(out.status.success(), "quick command must exit 0");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("rustc "),
+            "stdout must include rustc version"
         );
     }
 
@@ -230,14 +254,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeded timeout")]
     fn hung_child_triggers_timeout_panic_with_diagnostic() {
-        // `/bin/sleep` is invoked DIRECTLY (no shell wrapper) so
-        // SIGKILL from `child.kill()` actually terminates the hanging
-        // process. Going through `/bin/sh -c 'sleep 30'` would kill
-        // only the shell, leaving the orphan sleep holding the
-        // stdout/stderr pipe FDs open and making the subsequent
-        // `read_to_end` in drain_pipe_tail block for the full 30s.
-        let mut cmd = Command::new("/bin/sleep");
-        cmd.arg("30");
+        // The long-running command is invoked directly (no shell wrapper) so
+        // `child.kill()` terminates the process that owns stdout/stderr pipes.
+        // Killing a shell wrapper could leave an orphan child holding those FDs
+        // open, making the subsequent `read_to_end` block until the child exits.
+        let cmd = long_running_command();
         let _ =
             spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300));
     }
@@ -257,19 +278,25 @@ mod tests {
         std::fs::write(root.join("sub/b.bin"), b"0123456789").unwrap();
 
         let entries = list_dir_bounded(root, 200);
+        let normalized_entries: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.replace('\\', "/"))
+            .collect();
         assert!(
-            entries.iter().any(|e| e.starts_with("a.txt (5 bytes)")),
-            "expected a.txt entry with size; got: {entries:?}"
+            normalized_entries
+                .iter()
+                .any(|e| e.starts_with("a.txt (5 bytes)")),
+            "expected a.txt entry with size; got: {normalized_entries:?}"
         );
         assert!(
-            entries.iter().any(|e| e == "sub/"),
-            "expected sub/ directory entry; got: {entries:?}"
+            normalized_entries.iter().any(|e| e == "sub/"),
+            "expected sub/ directory entry; got: {normalized_entries:?}"
         );
         assert!(
-            entries
+            normalized_entries
                 .iter()
                 .any(|e| e.starts_with("sub/b.bin (10 bytes)")),
-            "expected nested file entry with size; got: {entries:?}"
+            "expected nested file entry with size; got: {normalized_entries:?}"
         );
     }
 

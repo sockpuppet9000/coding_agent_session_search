@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -120,12 +120,22 @@ fn start_http_fixture_server(routes: Vec<(&str, Vec<u8>, &str)>) -> HttpFixtureS
 }
 
 fn handle_http_request(mut stream: TcpStream, routes: &BTreeMap<String, (Vec<u8>, String)>) {
-    let mut buffer = [0_u8; 8192];
-    let read = match stream.read(&mut buffer) {
-        Ok(read) => read,
-        Err(_) => return,
-    };
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let mut request_bytes = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => return,
+        };
+        request_bytes.extend_from_slice(&buffer[..read]);
+        if request_bytes.windows(4).any(|window| window == b"\r\n\r\n")
+            || request_bytes.len() >= 64 * 1024
+        {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&request_bytes);
     let target = request
         .lines()
         .next()
@@ -149,6 +159,7 @@ fn handle_http_request(mut stream: TcpStream, routes: &BTreeMap<String, (Vec<u8>
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 #[test]

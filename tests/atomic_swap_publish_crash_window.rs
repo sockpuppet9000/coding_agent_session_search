@@ -291,6 +291,10 @@ fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish
         before_federated_readers.len() > 1,
         "forced shard planner settings should materialize a federated live index before rebuild"
     );
+    // The assertion above only proves the precondition. Keeping these readers
+    // open across the rebuild blocks directory renames on Windows, so release
+    // them before starting the intentional concurrent polling reader below.
+    drop(before_federated_readers);
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);

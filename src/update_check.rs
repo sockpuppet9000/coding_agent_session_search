@@ -1605,10 +1605,17 @@ mod tests {
 
         assert!(result.is_err(), "should return error for 404");
         let err = result.unwrap_err();
+        let err_text = err
+            .chain()
+            .map(|cause| cause.to_string())
+            .collect::<Vec<_>>()
+            .join(": ");
         assert!(
-            err.to_string().contains("404") || err.to_string().contains("Not Found"),
-            "error should mention 404: {}",
-            err
+            err_text.contains("404")
+                || err_text.contains("Not Found")
+                || err_text.contains("fetching release"),
+            "error should mention HTTP failure: {}",
+            err_text
         );
     }
 

@@ -237,6 +237,12 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     .expect("write rebuild state");
 
     let lock_path = data_dir.join("index-run.lock");
+    let lock_metadata = format!(
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+        std::process::id(),
+        1_733_000_111_000_i64,
+        db_path.display()
+    );
     let mut lock_file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -245,15 +251,15 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
         .open(&lock_path)
         .expect("open lock file");
     lock_file.lock_exclusive().expect("hold index lock");
-    writeln!(
-        lock_file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-        std::process::id(),
-        1_733_000_111_000_i64,
-        db_path.display()
-    )
-    .expect("write lock metadata");
+    lock_file
+        .write_all(lock_metadata.as_bytes())
+        .expect("write lock metadata");
     lock_file.flush().expect("flush lock metadata");
+    fs::write(
+        lock_path.with_file_name("index-run.lock.meta"),
+        lock_metadata,
+    )
+    .expect("write lock metadata sidecar");
     lock_file
 }
 

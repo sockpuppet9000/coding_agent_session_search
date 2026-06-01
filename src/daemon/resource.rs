@@ -223,6 +223,8 @@ mod tests {
         let monitor = ResourceMonitor::new();
         #[cfg(target_os = "linux")]
         assert!(monitor.pid > 0);
+        #[cfg(not(target_os = "linux"))]
+        let _ = monitor;
     }
 
     #[test]

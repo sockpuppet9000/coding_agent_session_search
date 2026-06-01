@@ -892,6 +892,8 @@ pub struct IndexingProgress {
     pub discovered_agent_names: Mutex<Vec<String>>,
     /// Last error message from background indexer, if any
     pub last_error: Mutex<Option<String>>,
+    /// Fine-grained startup/pre-scan step for phase=0 stall diagnostics.
+    pub preparation_step: Mutex<String>,
     /// Structured stats for JSON output (T7.4)
     pub stats: Mutex<IndexingStats>,
     /// Live authoritative rebuild queue depth for same-process progress output.
@@ -1000,6 +1002,14 @@ impl IndexingProgress {
             .map(|g| g.clone())
             .unwrap_or_default();
         let last_error: Option<String> = self.last_error.lock().ok().and_then(|g| g.clone());
+        let preparation_step = if phase == 0 {
+            self.preparation_step
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let rebuild_pipeline_queue_depth =
             self.rebuild_pipeline_queue_depth.load(Ordering::Relaxed);
         let rebuild_pipeline_inflight_message_bytes = self
@@ -1169,6 +1179,7 @@ impl IndexingProgress {
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
             "last_error": last_error,
+            "preparation_step": non_empty_json_string(preparation_step),
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
             "rebuild_pipeline": {
@@ -1500,6 +1511,25 @@ fn record_incremental_canonical_lexical_repair(
     }
 }
 
+fn set_progress_preparation_step(progress: Option<&Arc<IndexingProgress>>, step: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut current) = progress.preparation_step.lock() {
+        current.clear();
+        current.push_str(step);
+    }
+}
+
+fn clear_progress_preparation_step(progress: Option<&Arc<IndexingProgress>>) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut current) = progress.preparation_step.lock() {
+        current.clear();
+    }
+}
+
 fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
     let Some(progress) = progress else {
         return;
@@ -1507,6 +1537,7 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
 
     progress.phase.store(0, Ordering::Relaxed);
     progress.is_rebuilding.store(false, Ordering::Relaxed);
+    clear_progress_preparation_step(Some(progress));
     progress
         .rebuild_pipeline_queue_depth
         .store(0, Ordering::Relaxed);
@@ -7477,10 +7508,11 @@ fn lexical_rebuild_content_fingerprint(
 }
 
 fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
-    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let db_identity = crate::normalize_path_identity(db_path);
+    let mut storage = FrankenStorage::open_readonly(&db_identity).with_context(|| {
         format!(
             "opening readonly storage to compute lexical fingerprint for {}",
-            db_path.display()
+            db_identity.display()
         )
     })?;
     let total_conversations = count_total_conversations_exact(&storage)?;
@@ -7904,7 +7936,13 @@ fn should_repair_fallback_fts_after_full_index_run(
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
 ) -> bool {
-    full_rebuild && !canonical_only_full_rebuild
+    full_rebuild && !canonical_only_full_rebuild && fallback_fts_auto_repair_enabled()
+}
+
+fn fallback_fts_auto_repair_enabled() -> bool {
+    dotenvy::var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR")
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11256,6 +11294,7 @@ pub fn run_index(
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     set_progress_last_error(opts.progress.as_ref(), None);
+    set_progress_preparation_step(opts.progress.as_ref(), "acquiring_index_run_lock");
     let initial_lock_mode = if opts.watch {
         SearchMaintenanceMode::WatchStartup
     } else if opts
@@ -11298,9 +11337,11 @@ pub fn run_index(
         return Ok(());
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_index_storage_headroom");
     let index_path = index_dir(&opts.data_dir)?;
     ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
+        set_progress_preparation_step(opts.progress.as_ref(), "checking_readonly_lexical_resume");
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
             &index_path,
             &opts.db_path,
@@ -11353,10 +11394,12 @@ pub fn run_index(
             }
         }
     }
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_readonly_force_rebuild");
     if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
         return Ok(());
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "opening_canonical_storage");
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let defer_checkpoints = !opts.watch;
@@ -11366,6 +11409,7 @@ pub fn run_index(
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
     // database" from frankensqlite.
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_storage_writable");
     if let Err(err) = storage
         .raw()
         .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
@@ -11397,48 +11441,14 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
 
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_db_resident_fts");
     if let Err(err) = storage.validate_fts_messages_integrity() {
         tracing::warn!(
             db_path = %opts.db_path.display(),
             error = %err,
-            "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
+            "derived fallback FTS metadata is inconsistent; continuing without DB-resident FTS repair because Tantivy is authoritative"
         );
-        storage.close_best_effort_in_place();
-        let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-            &opts.db_path,
-            Duration::from_secs(10),
-        )
-        .with_context(|| {
-            format!(
-                "opening fresh storage for fallback FTS repair before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        let repair = repair_storage.ensure_search_fallback_fts_consistency();
-        repair_storage.close_best_effort_in_place();
-        let repair = repair.with_context(|| {
-            format!(
-                "repairing derived fallback FTS before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        tracing::info!(
-            db_path = %opts.db_path.display(),
-            ?repair,
-            "derived fallback FTS repair completed before index pipeline"
-        );
-        storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-            &opts.db_path,
-            Duration::from_secs(10),
-        )
-        .with_context(|| {
-            format!(
-                "reopening storage after fallback FTS repair before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+        storage.disable_db_resident_fts_maintenance_for_process();
     }
 
     if opts.full
@@ -11457,6 +11467,7 @@ pub fn run_index(
         ));
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_watch_once_noop");
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
@@ -11485,6 +11496,7 @@ pub fn run_index(
     // poison every future run. A failed sweep is now fatal for this run:
     // continuing after OOM/corruption can reuse a poisoned connection and make
     // the canonical archive worse.
+    set_progress_preparation_step(opts.progress.as_ref(), "cleaning_orphan_fk_rows");
     if let Err(err) = storage.cleanup_orphan_fk_rows() {
         tracing::warn!(
             target: "cass::fk_repair",
@@ -11496,6 +11508,7 @@ pub fn run_index(
         return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
 
+    set_progress_preparation_step(opts.progress.as_ref(), "counting_canonical_sessions");
     let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     if opts.full
         && !opened_fresh_for_full
@@ -11536,6 +11549,10 @@ pub fn run_index(
         && initial_canonical_sessions_before_salvage > 0;
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
+    set_progress_preparation_step(
+        opts.progress.as_ref(),
+        "checking_lexical_rebuild_checkpoint",
+    );
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
         false
@@ -11637,6 +11654,7 @@ pub fn run_index(
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
+    set_progress_preparation_step(opts.progress.as_ref(), "checking_tantivy_reader");
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
         // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
         // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
@@ -12297,6 +12315,17 @@ pub fn run_index(
                         }
                     }
                 }
+
+                if !scan_canonical_mutations.changed()
+                    && let Some((exact_total_conversations, exact_total_messages)) =
+                        initial_matching_lexical_checkpoint.completed_exact_totals
+                {
+                    record_exact_total_counts_in_progress(
+                        opts.progress.as_ref(),
+                        exact_total_conversations,
+                        exact_total_messages,
+                    );
+                }
             }
         }
 
@@ -12556,6 +12585,13 @@ pub fn run_index(
                     "skipping fallback FTS consistency repair because this no-op full run preserved an archive fingerprint already known to be healthy"
                 );
             }
+            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::Skipped { reason }) => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    ?reason,
+                    "skipping fallback FTS consistency repair after full index run"
+                );
+            }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
@@ -12586,7 +12622,8 @@ pub fn run_index(
         tracing::info!(
             db_path = %opts.db_path.display(),
             canonical_only_full_rebuild,
-            "skipping frankensqlite-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
+            auto_repair_enabled = fallback_fts_auto_repair_enabled(),
+            "skipping frankensqlite-owned fallback FTS rebuild after full index run"
         );
     }
 
@@ -15250,6 +15287,7 @@ static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // ubs:ignore
 struct LexicalPublishInjectedRenameFailureGuard {
     previous: Option<LexicalPublishInjectedRenameFailure>,
 }
@@ -15266,6 +15304,7 @@ impl Drop for LexicalPublishInjectedRenameFailureGuard {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // ubs:ignore
 fn inject_lexical_publish_rename_failure_once(
     site: LexicalPublishRenameSite,
     raw_os_error: i32,
@@ -15316,13 +15355,53 @@ fn rename_lexical_publish_path(
     maybe_inject_lexical_publish_rename_failure(site)?;
     #[cfg(not(test))]
     let _ = site;
+    rename_lexical_publish_path_inner(src, dst)
+}
+
+#[cfg(not(windows))]
+fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::rename(src, dst)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(windows)]
+fn rename_lexical_publish_path_inner(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Windows refuses directory renames while readers, AV scanners, or indexers
+    // hold child handles; a publish should wait out short-lived handles but still
+    // report a retryable error when the path remains blocked.
+    const MAX_ATTEMPTS: usize = 1_500;
+    const SLEEP_MS: u64 = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(err) if windows_lexical_publish_rename_is_transient(&err) => {
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                thread::sleep(Duration::from_millis(SLEEP_MS));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn windows_lexical_publish_rename_is_transient(err: &std::io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    matches!(
+        err.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+    )
+}
+
 fn maybe_pause_lexical_publish_for_kill_relaunch(
     index_path: &Path,
     canonical_sidecar: &Path,
+    stage: &'static str,
 ) -> Result<()> {
     let sentinel_path = match dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL") {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
@@ -15334,7 +15413,7 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
         .filter(|value| *value > 0)
         .unwrap_or(30_000);
     let payload = serde_json::json!({
-        "stage": "linux_swap_committed_prior_live_parked",
+        "stage": stage,
         "pid": std::process::id(),
         "live_index_path": index_path.display().to_string(),
         "canonical_sidecar_path": canonical_sidecar.display().to_string(),
@@ -15469,13 +15548,17 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
             }
         }
 
-        maybe_pause_lexical_publish_for_kill_relaunch(index_path, &canonical_sidecar)
-            .with_context(|| {
-                format!(
-                    "pausing lexical publish after parking prior live generation at {}",
-                    canonical_sidecar.display()
-                )
-            })?;
+        maybe_pause_lexical_publish_for_kill_relaunch(
+            index_path,
+            &canonical_sidecar,
+            "linux_swap_committed_prior_live_parked",
+        )
+        .with_context(|| {
+            format!(
+                "pausing lexical publish after parking prior live generation at {}",
+                canonical_sidecar.display()
+            )
+        })?;
 
         // B: move canonical sidecar into `.lexical-publish-backups/` under
         // a unique dated name. Failure here is recoverable without rollback:
@@ -15587,6 +15670,17 @@ fn publish_via_rename_pair(
             }
         }
     }
+    maybe_pause_lexical_publish_for_kill_relaunch(
+        index_path,
+        &in_progress_backup_path,
+        "rename_pair_publish_committed_prior_live_parked",
+    )
+    .with_context(|| {
+        format!(
+            "pausing lexical publish after parking prior live generation at {}",
+            in_progress_backup_path.display()
+        )
+    })?;
     if let Err(retain_err) = rename_lexical_publish_path(
         &in_progress_backup_path,
         retained_backup_path,
@@ -25437,6 +25531,29 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    fn read_index_run_lock_payload_for_assertion(lock_path: &Path) -> Result<String> {
+        match std::fs::read_to_string(lock_path) {
+            Ok(raw) => Ok(raw),
+            Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading index-run lock metadata sidecar {} after Windows lock conflict on {}",
+                        sidecar_path.display(),
+                        lock_path.display()
+                    )
+                })
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "reading index-run lock payload for assertion {}",
+                    lock_path.display()
+                )
+            }),
+        }
+    }
+
     #[test]
     fn scan_path_exclusions_value_active_handles_commas_and_newlines() {
         assert!(!scan_path_exclusions_value_active(None));
@@ -26695,7 +26812,7 @@ mod tests {
         // key with a fresh timestamp. Parsing it lets a future change
         // to the field's value type surface as a precise test failure.
         let lock_path = tmp.path().join("index-run.lock");
-        let raw = std::fs::read_to_string(&lock_path)?;
+        let raw = read_index_run_lock_payload_for_assertion(&lock_path)?;
         let last_progress_lines: Vec<&str> = raw
             .lines()
             .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
@@ -26789,7 +26906,7 @@ mod tests {
         let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
             .expect("acquire index run lock");
         let lock_path = tmp.path().join("index-run.lock");
-        let before = std::fs::read_to_string(&lock_path).unwrap();
+        let before = read_index_run_lock_payload_for_assertion(&lock_path).unwrap();
         let old_progress = before
             .lines()
             .find_map(|line| line.strip_prefix("last_progress_at_ms="))
@@ -26807,7 +26924,7 @@ mod tests {
         )
         .expect("heartbeat should persist indexer-owned progress");
 
-        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        let refreshed = read_index_run_lock_payload_for_assertion(&lock_path).unwrap();
         let expected_line = format!("last_progress_at_ms={bumped_progress}");
         assert!(
             refreshed.lines().any(|line| line == expected_line),
@@ -32471,6 +32588,24 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_json_includes_preparation_step_only_while_preparing() {
+        let progress = Arc::new(IndexingProgress::default());
+        set_progress_preparation_step(Some(&progress), "checking_tantivy_reader");
+
+        let preparing = progress.snapshot_json(120_000);
+        assert_eq!(preparing["phase_code"], serde_json::json!(0));
+        assert_eq!(
+            preparing["preparation_step"],
+            serde_json::json!("checking_tantivy_reader")
+        );
+
+        progress.phase.store(1, Ordering::Relaxed);
+        let scanning = progress.snapshot_json(121_000);
+        assert_eq!(scanning["phase"], serde_json::json!("scanning"));
+        assert_eq!(scanning["preparation_step"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn snapshot_json_includes_rebuild_pipeline_runtime_metrics() {
         let progress = IndexingProgress::default();
         progress.phase.store(2, Ordering::Relaxed);
@@ -34208,7 +34343,7 @@ mod tests {
 
     #[test]
     fn disk_headroom_skip_env_value_parser_is_truthy_not_presence_based() {
-        for truthy in ["1", "true", "YES", "on"] {
+        for truthy in ["1", "true", "YES", "on", " True "] {
             assert!(
                 env_value_truthy(truthy),
                 "expected {truthy:?} to disable the headroom check"
@@ -35047,19 +35182,51 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fts_repair_is_skipped_for_canonical_only_full_rebuild() {
-        assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
-        assert!(should_repair_fallback_fts_after_full_index_run(true, false));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, false
-        ));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, true
-        ));
+    #[serial] // ubs:ignore
+    fn fallback_fts_repair_is_disabled_by_default() -> Result<()> {
+        let _guard = unset_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR");
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(true, true),
+            "canonical-only full rebuild must not repair DB-resident FTS by default"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(true, false),
+            "full rebuild must not repair DB-resident FTS by default"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(false, false),
+            "incremental rebuild must not repair DB-resident FTS"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(false, true),
+            "canonical-only incremental rebuild must not repair DB-resident FTS"
+        );
+        Ok(())
     }
 
     #[test]
+    #[serial] // ubs:ignore
+    fn fallback_fts_repair_can_be_enabled_explicitly() -> Result<()> {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", " on ");
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(true, true),
+            "canonical-only full rebuild must still skip DB-resident FTS repair"
+        );
+        anyhow::ensure!(
+            should_repair_fallback_fts_after_full_index_run(true, false),
+            "explicit opt-in should repair DB-resident FTS after non-canonical full rebuilds"
+        );
+        anyhow::ensure!(
+            !should_repair_fallback_fts_after_full_index_run(false, false),
+            "incremental rebuild must not repair DB-resident FTS"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial] // ubs:ignore
     fn full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-healthy.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -35078,7 +35245,9 @@ mod tests {
     }
 
     #[test]
-    fn full_run_fallback_fts_repair_rebuilds_missing_schema_when_needed() {
+    #[serial] // ubs:ignore
+    fn full_run_fallback_fts_repair_skips_missing_schema() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-missing.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -35090,13 +35259,17 @@ mod tests {
         assert_eq!(
             repair,
             Some(FallbackFtsRepairOutcome::Repaired(
-                FtsConsistencyRepair::Rebuilt { inserted_rows: 4 }
+                FtsConsistencyRepair::Skipped {
+                    reason: crate::storage::sqlite::FtsConsistencySkipReason::Absent
+                }
             ))
         );
     }
 
     #[test]
+    #[serial] // ubs:ignore
     fn full_run_fallback_fts_repair_skips_known_healthy_archive_fingerprint() {
+        let _guard = set_env_var("CASS_DB_RESIDENT_FTS_AUTO_REPAIR", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-known-healthy.db");
         let storage = FrankenStorage::open(&db_path).unwrap();

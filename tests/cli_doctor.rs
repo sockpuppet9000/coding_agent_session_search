@@ -3824,7 +3824,10 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     assert_eq!(lock["retry_policy"].as_str(), Some("wait-and-retry"));
     assert_eq!(lock["wait_duration_ms"].as_u64(), Some(30_000));
     assert_eq!(lock["manual_delete_allowed"].as_bool(), Some(false));
+    #[cfg(not(windows))]
     assert_eq!(lock["owner_command"].as_str(), Some("cass doctor --fix"));
+    #[cfg(windows)]
+    assert_eq!(lock["owner_command"].as_str(), None);
     assert!(
         lock["recommended_action"]
             .as_str()

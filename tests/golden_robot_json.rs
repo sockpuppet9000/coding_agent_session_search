@@ -37,9 +37,11 @@ use walkdir::WalkDir;
 /// deterministic test output (no update check, no ambient data-dir surprise).
 fn cass_cmd(test_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.current_dir(test_home);
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         // Pin data dir so the test never touches the user's real cache.
         .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
         .env("HOME", test_home)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
@@ -315,6 +317,42 @@ fn looks_like_json_schema_object(value: &Value) -> bool {
 fn normalize_live_robot_values(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            if map.contains_key("topology")
+                && map.contains_key("reserved_core_policy")
+                && map.contains_key("advisory_budgets")
+                && map.contains_key("fallback_active")
+            {
+                if let Some(Value::Object(topology)) = map.get_mut("topology") {
+                    if let Some(source) = topology.get_mut("source") {
+                        *source = json!("[TOPOLOGY_SOURCE]");
+                    }
+                    for key in ["memory_total_bytes", "memory_available_bytes"] {
+                        if let Some(child) = topology.get_mut(key) {
+                            *child = json!("[LIVE_BYTES]");
+                        }
+                    }
+                }
+                if let Some(Value::Object(reserved_core_policy)) =
+                    map.get_mut("reserved_core_policy")
+                {
+                    if let Some(policy) = reserved_core_policy.get_mut("policy") {
+                        *policy = json!("[TOPOLOGY_POLICY]");
+                    }
+                    if let Some(reason) = reserved_core_policy.get_mut("reason") {
+                        *reason = json!("[TOPOLOGY_REASON]");
+                    }
+                }
+                if let Some(fallback_active) = map.get_mut("fallback_active") {
+                    *fallback_active = json!("[TOPOLOGY_FALLBACK_ACTIVE]");
+                }
+                if let Some(decision_reason) = map.get_mut("decision_reason") {
+                    *decision_reason = json!("[TOPOLOGY_DECISION_REASON]");
+                }
+                if let Some(proof_notes) = map.get_mut("proof_notes") {
+                    *proof_notes = json!(["[TOPOLOGY_PROOF_NOTES]"]);
+                }
+            }
+
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
                 && map.contains_key("agent");
@@ -424,6 +462,30 @@ fn normalize_live_robot_values(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn normalize_status_shape_probe_values(status: &mut Value) {
+    for pointer in [
+        "/rebuild/pipeline/controller_loadavg_high_watermark_1m",
+        "/rebuild/pipeline/controller_loadavg_low_watermark_1m",
+    ] {
+        if let Some(value) = status.pointer_mut(pointer)
+            && value.is_null()
+        {
+            *value = json!(0.0);
+        }
+    }
+
+    for pointer in [
+        "/topology_budget/topology/memory_total_bytes",
+        "/topology_budget/topology/memory_available_bytes",
+    ] {
+        if let Some(value) = status.pointer_mut(pointer)
+            && value.is_null()
+        {
+            *value = json!(0);
+        }
     }
 }
 
@@ -565,6 +627,13 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
             "agent": "aider",
             "snippet": "private snippet",
             "content": "private prompt and assistant transcript"
+        }, {
+            "source_path": "/data/projects/coding_agent_session_search/tests/fixtures/search_demo_data/codex/demo.jsonl",
+            "workspace": "/data/projects/coding_agent_session_search",
+            "line_number": 7,
+            "agent": "codex",
+            "snippet": "historical private snippet",
+            "content": "historical private content"
         }]
     }))
     .expect("serialize fixture");
@@ -579,6 +648,13 @@ fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
     assert_eq!(scrubbed["results"][0]["workspace"], "[REPO]");
     assert_eq!(scrubbed["results"][0]["snippet"], "[RESULT_SNIPPET]");
     assert_eq!(scrubbed["results"][0]["content"], "[RESULT_CONTENT]");
+    assert_eq!(
+        scrubbed["results"][1]["source_path"],
+        "[REPO]/tests/fixtures/search_demo_data/codex/demo.jsonl"
+    );
+    assert_eq!(scrubbed["results"][1]["workspace"], "[REPO]");
+    assert_eq!(scrubbed["results"][1]["snippet"], "[RESULT_SNIPPET]");
+    assert_eq!(scrubbed["results"][1]["content"], "[RESULT_CONTENT]");
     assert!(
         !serde_json::to_string(&scrubbed)
             .expect("serialize scrubbed fixture")
@@ -628,6 +704,17 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     if !repo_root.is_empty() {
         out = out.replace(repo_root, "[REPO]");
     }
+    out = out.replace("/data/projects/coding_agent_session_search", "[REPO]");
+
+    let live_platform = format!(
+        "\"platform\": {{\n    \"os\": \"{}\",\n    \"arch\": \"{}\"\n  }}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    out = out.replace(
+        &live_platform,
+        "\"platform\": {\n    \"os\": \"[OS]\",\n    \"arch\": \"[ARCH]\"\n  }",
+    );
 
     // 4. UUIDs.
     let uuid_re =
@@ -1861,6 +1948,7 @@ fn status_shape_matches_golden() {
         &["status", "--json"],
         ExpectStatus::ExitOk,
     );
+    normalize_status_shape_probe_values(&mut status);
     // Keep the warnings array item schema pinned even when this fixture has no
     // warning instances.
     if let Some(warnings) = status

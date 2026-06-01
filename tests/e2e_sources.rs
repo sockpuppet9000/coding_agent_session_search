@@ -12,6 +12,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::storage::sqlite::FrankenStorage;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -92,6 +93,69 @@ fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
     storage
         .insert_conversation_tree(agent_id, None, &conversation)
         .unwrap();
+}
+
+fn seed_legacy_fts_for_archive_conversations(db_path: &Path) -> anyhow::Result<()> {
+    let storage = FrankenStorage::open(db_path)?;
+    let conn = storage.raw();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+            content,
+            title,
+            agent,
+            workspace,
+            source_path,
+            created_at UNINDEXED,
+            message_id UNINDEXED,
+            tokenize='porter'
+        );",
+    )?;
+
+    let no_params = Vec::<ParamValue>::new();
+    let rows: Vec<(i64, String, String, String, String, String, i64)> = conn.query_map_collect(
+        "SELECT m.id,
+                COALESCE(m.content, ''),
+                COALESCE(c.title, ''),
+                COALESCE(a.slug, ''),
+                COALESCE(w.path, ''),
+                COALESCE(c.source_path, ''),
+                COALESCE(m.created_at, c.started_at, 0)
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         LEFT JOIN agents a ON a.id = c.agent_id
+         LEFT JOIN workspaces w ON w.id = c.workspace_id
+         ORDER BY m.id",
+        &no_params,
+        |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+                row.get_typed(6)?,
+            ))
+        },
+    )?;
+
+    for (message_id, content, title, agent, workspace, source_path, created_at) in rows {
+        let mut params = Vec::with_capacity(7);
+        params.extend(std::iter::once(ParamValue::from(message_id)));
+        params.extend(std::iter::once(ParamValue::from(content.as_str())));
+        params.extend(std::iter::once(ParamValue::from(title.as_str())));
+        params.extend(std::iter::once(ParamValue::from(agent.as_str())));
+        params.extend(std::iter::once(ParamValue::from(workspace.as_str())));
+        params.extend(std::iter::once(ParamValue::from(source_path.as_str())));
+        params.extend(std::iter::once(ParamValue::from(created_at)));
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1)",
+            &params,
+        )?;
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -318,7 +382,7 @@ fn sources_agents_include_removes_existing_exclusion() {
 }
 
 #[test]
-fn sources_agents_exclude_purges_local_archive_data_by_default() {
+fn sources_agents_exclude_purges_local_archive_data_by_default() -> anyhow::Result<()> {
     let tracker = tracker_for("sources_agents_exclude_purges_local_archive_data_by_default");
     let _trace_guard = tracker.trace_env_guard();
 
@@ -334,6 +398,7 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
 
     seed_archive_conversation(&db_path, "openclaw", "purge-me");
     seed_archive_conversation(&db_path, "codex", "keep-me");
+    seed_legacy_fts_for_archive_conversations(&db_path)?;
 
     let output = cargo_bin_cmd!("cass")
         .args(["sources", "agents", "exclude", "openclaw"])
@@ -353,6 +418,26 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     let conversations = storage.list_conversations(10, 0).unwrap();
     assert_eq!(conversations.len(), 1);
     assert_eq!(conversations[0].agent_slug, "codex");
+    let no_params = Vec::<ParamValue>::new();
+    let fts_schema_rows: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        &no_params,
+        |row| row.get_typed(0),
+    )?;
+    anyhow::ensure!(
+        fts_schema_rows == 1,
+        "fixture keeps optional DB-resident FTS present while purge treats it as derived data"
+    );
+    let fts_rows_after_purge: i64 =
+        storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", &no_params, |row| {
+                row.get_typed(0)
+            })?;
+    anyhow::ensure!(
+        fts_rows_after_purge == 2,
+        "agent archive purge should best-effort remove stale optional FTS rows"
+    );
 
     let search_output = cargo_bin_cmd!("cass")
         .args(["search", "purge-me", "--robot", "--limit", "5"])
@@ -422,6 +507,7 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
         "expected retained codex data to remain searchable: {}",
         String::from_utf8_lossy(&search_output.stdout)
     );
+    Ok(())
 }
 
 /// Test: sources list --verbose shows additional details.

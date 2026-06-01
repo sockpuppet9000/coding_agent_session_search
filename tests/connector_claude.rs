@@ -463,9 +463,13 @@ fn claude_connector_sets_external_id() {
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
+    let external_id = convs[0]
+        .external_id
+        .as_deref()
+        .map(|id| id.replace('\\', "/"));
     assert_eq!(
-        convs[0].external_id,
-        Some("projects/test-proj/unique-session-id.jsonl".to_string())
+        external_id.as_deref(),
+        Some("projects/test-proj/unique-session-id.jsonl")
     );
 }
 

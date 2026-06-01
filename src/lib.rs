@@ -1294,7 +1294,6 @@ pub enum Commands {
     Analytics(AnalyticsCommand),
 
     /// Run the semantic model daemon (Unix only)
-    #[cfg(unix)]
     Daemon {
         /// Socket path to listen on (default comes from env or built-in config)
         #[arg(long)]
@@ -6799,7 +6798,6 @@ async fn execute_cli(
                 Commands::Analytics(subcmd) => {
                     run_analytics(subcmd, cli.db.clone(), cli)?;
                 }
-                #[cfg(unix)]
                 Commands::Daemon {
                     socket,
                     idle_timeout,
@@ -7281,7 +7279,6 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
-                #[cfg(unix)]
                 Commands::Daemon {
                     socket,
                     idle_timeout,
@@ -14088,15 +14085,56 @@ fn open_franken_cli_read_db(
                     if let Some(fts_err) =
                         crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
                     {
-                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
+                        match crate::storage::sqlite::open_franken_raw_connection_with_timeout(
+                            &path,
+                            busy_timeout,
+                        ) {
+                            Ok(conn) => {
+                                warn!(
+                                    error = %fts_err,
+                                    db_path = %path.display(),
+                                    reason,
+                                    "readonly open was blocked by optional DB-resident FTS metadata; continuing with a query-only raw connection"
+                                );
+                                conn
+                            }
+                            Err(raw_write_err) => {
+                                match crate::storage::sqlite::FrankenStorage::open(&path) {
+                                    Ok(storage) => {
+                                        warn!(
+                                            error = %fts_err,
+                                            raw_write_error = %raw_write_err,
+                                            db_path = %path.display(),
+                                            reason,
+                                            "raw read fallback was blocked by optional DB-resident FTS metadata; continuing with a storage-open raw connection"
+                                        );
+                                        storage.into_raw()
+                                    }
+                                    Err(storage_write_err) => {
+                                        tracing::debug!(
+                                            raw_write_error = %raw_write_err,
+                                            storage_write_error = %storage_write_err,
+                                            db_path = %path.display(),
+                                            reason,
+                                            "query-only fallback after optional FTS open failure also failed"
+                                        );
+                                        return Err(fts_messages_integrity_cli_error(
+                                            reason,
+                                            fts_err.into(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(CliError {
+                            code: 9,
+                            kind: CliErrorKind::DbOpen.kind_str(),
+                            message,
+                            hint: None,
+                            retryable: readonly_retryable || raw_readonly_retryable,
+                        });
                     }
-                    return Err(CliError {
-                        code: 9,
-                        kind: CliErrorKind::DbOpen.kind_str(),
-                        message,
-                        hint: None,
-                        retryable: readonly_retryable || raw_readonly_retryable,
-                    });
                 }
             }
         }
@@ -14233,12 +14271,14 @@ fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliErr
     }
 }
 
-fn validate_fts_messages_integrity_for_cli(
-    conn: &frankensqlite::Connection,
-    surface: &str,
-) -> CliResult<()> {
-    crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        .map_err(|err| fts_messages_integrity_cli_error(surface, err))
+fn warn_on_fts_messages_integrity_for_cli(conn: &frankensqlite::Connection, surface: &str) {
+    if let Err(err) = crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn) {
+        warn!(
+            surface,
+            error = %err,
+            "ignoring DB-resident FTS integrity failure because Tantivy is authoritative"
+        );
+    }
 }
 
 fn franken_query_row_map_retry<T, F>(
@@ -15098,12 +15138,10 @@ fn probe_state_db(
     snapshot.opened = true;
     if let Err(err) = crate::storage::sqlite::validate_fts_messages_integrity_for_connection(&conn)
     {
-        snapshot.opened = false;
-        snapshot.open_error = Some(err.to_string());
-        snapshot.open_retryable = false;
-        snapshot.counts_skipped = true;
-        let _ = close_franken_cli_read_db(conn, db_path, reason);
-        return snapshot;
+        tracing::warn!(
+            error = %err,
+            "ignoring DB-resident FTS integrity failure for health snapshot because Tantivy is authoritative"
+        );
     }
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
@@ -17168,7 +17206,6 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Models(..)) => "models".to_string(),
         Some(Commands::Swarm(..)) => "swarm".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
-        #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
@@ -17708,6 +17745,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPECT_NO_COLOR=1                  honor global NO_COLOR".to_string(),
             "  CASS_TRACE_FILE                          default trace path".to_string(),
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
+            "  CASS_DB_RESIDENT_FTS_AUTO_REPAIR=1       opt in to repairing an existing DB-resident fts_messages cache during full-index maintenance; missing fts_messages stays absent".to_string(),
             "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
             "  CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE=<F>  loadavg/core threshold for step-down (default 1.25)".to_string(),
@@ -23447,7 +23485,7 @@ fn run_stats(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
-    validate_fts_messages_integrity_for_cli(&conn, "stats")?;
+    warn_on_fts_messages_integrity_for_cli(&conn, "stats");
     let conversation_columns = doctor_table_columns(&conn, "conversations");
     let source_id_sql = if conversation_columns.contains("source_id") {
         "c.source_id"
@@ -24900,6 +24938,10 @@ fn build_doctor_safe_auto_run_report(
 
     for check in input.check_reports {
         if check.status == "pass" && !check.fix_applied {
+            continue;
+        }
+        // Provider directory discovery is diagnostic; it is not a repair gate for derived assets.
+        if check.name.eq("sessions") && !check.fix_available && !check.fix_applied {
             continue;
         }
         let action = doctor_safe_auto_action_for_check(check).to_string();
@@ -27853,6 +27895,25 @@ fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
         .unwrap_or_else(|| "[external]".to_string())
 }
 
+fn doctor_portable_relative_path(relative_path: &Path) -> Option<String> {
+    if relative_path.as_os_str().is_empty() || relative_path.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            std::path::Component::Normal(name)
+                if doctor_portable_relative_component_is_safe(name) =>
+            {
+                parts.push(name.to_string_lossy().into_owned());
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 fn doctor_redacted_text(text: &str, data_dir: &Path) -> String {
     let data_dir_text = data_dir.display().to_string();
     text.replace(&data_dir_text, "[cass-data]")
@@ -28559,7 +28620,10 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&raw_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("raw-mirror-manifests").join(relative_to_root);
+            let Some(relative_to_root) = doctor_portable_relative_path(relative_to_root) else {
+                continue;
+            };
+            let relative = PathBuf::from(format!("raw-mirror-manifests/{relative_to_root}"));
             copy_artifact!("raw_mirror_manifest", path, &relative, false, None);
         }
     } else {
@@ -28592,7 +28656,10 @@ fn capture_doctor_forensic_bundle(
             let Ok(relative_to_root) = path.strip_prefix(&lexical_manifest_root) else {
                 continue;
             };
-            let relative = Path::new("index-manifests").join(relative_to_root);
+            let Some(relative_to_root) = doctor_portable_relative_path(relative_to_root) else {
+                continue;
+            };
+            let relative = PathBuf::from(format!("index-manifests/{relative_to_root}"));
             copy_artifact!("lexical_generation_manifest", path, &relative, false, None);
         }
     } else {
@@ -34273,13 +34340,12 @@ fn doctor_archive_normalize_apply_argv(
     plan_fingerprint: &str,
 ) -> Vec<String> {
     let mut argv = vec!["cass".to_string()];
-    let data_dir_identity = doctor_path_identity_for_fingerprint(data_dir);
     let db_path_identity = doctor_path_identity_for_fingerprint(db_path);
     let default_db_identity =
         doctor_path_identity_for_fingerprint(&data_dir.join("agent_search.db"));
     if db_path_identity != default_db_identity {
         argv.push("--db".to_string());
-        argv.push(db_path_identity);
+        argv.push(doctor_path_argument_for_apply_argv(db_path));
     }
     argv.extend([
         "doctor".to_string(),
@@ -34292,8 +34358,12 @@ fn doctor_archive_normalize_apply_argv(
         argv.push("--json".to_string());
     }
     argv.push("--data-dir".to_string());
-    argv.push(data_dir_identity);
+    argv.push(doctor_path_argument_for_apply_argv(data_dir));
     argv
+}
+
+fn doctor_path_argument_for_apply_argv(path: &Path) -> String {
+    normalize_path_identity(path).display().to_string()
 }
 
 fn doctor_path_identity_for_fingerprint(path: &Path) -> String {
@@ -36817,7 +36887,7 @@ fn doctor_candidate_live_inventory(
 fn doctor_candidate_relative_path(candidate_dir: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(candidate_dir)
         .ok()
-        .map(|relative| relative.display().to_string())
+        .and_then(doctor_portable_relative_path)
 }
 
 fn doctor_candidate_artifact_class(relative_path: &str) -> DoctorAssetClass {
@@ -39760,6 +39830,15 @@ fn doctor_archive_export_relative_is_safe(relative_path: &str) -> bool {
     doctor_forensic_relative_path_is_safe(Path::new(relative_path))
 }
 
+fn doctor_archive_export_extra_file_is_ignorable_probe_lock(relative_path: &str) -> bool {
+    matches!(
+        relative_path,
+        "data/agent_search.db-lock-pending"
+            | "data/agent_search.db-lock-reserved"
+            | "data/agent_search.db-lock-shared"
+    )
+}
+
 fn doctor_archive_export_asset_id(
     relative_path: &str,
     asset_class: DoctorAssetClass,
@@ -40295,7 +40374,8 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
                 "archive-export-manifest.json"
                     | "archive-export-receipt.json"
                     | "archive-export-event-log.json"
-            ) {
+            ) || doctor_archive_export_extra_file_is_ignorable_probe_lock(&relative)
+            {
                 continue;
             }
             if !expected_paths.contains(&relative) {
@@ -43783,6 +43863,26 @@ fn doctor_baseline_resolve_path(
     requested_path: Option<&PathBuf>,
     writes_baseline: bool,
 ) -> CliResult<PathBuf> {
+    if let Some(path) = requested_path
+        && !path.is_absolute()
+        && path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message: format!(
+                "doctor baseline path is not portable-safe: {}",
+                path.display()
+            ),
+            hint: Some("Use a simple baseline id or an absolute JSON file path.".to_string()),
+            retryable: false,
+        });
+    }
     let path = if let Some(path) = requested_path {
         if path.is_absolute() {
             path.clone()
@@ -43795,12 +43895,10 @@ fn doctor_baseline_resolve_path(
             .join("baselines")
             .join(format!("{baseline_id}.json"))
     };
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::Prefix(_)
-        )
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(CliError {
             code: 2,
             kind: "usage",
@@ -71380,6 +71478,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Suppress NDJSON progress events from cass index --json when set to 1.",
         ),
         env_var_capability(
+            "CASS_DB_RESIDENT_FTS_AUTO_REPAIR",
+            Some("0"),
+            "Opt in to repairing an existing DB-resident fts_messages cache during full-index maintenance; missing fts_messages stays absent.",
+        ),
+        env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
             None,
             "Select the semantic embedder/model implementation when configured.",
@@ -72549,6 +72652,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "rebuilding": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
@@ -72684,6 +72788,9 @@ fn response_schema_rebuild_state() -> serde_json::Value {
         "type": "object",
         "properties": {
             "active": { "type": "boolean" },
+            "stalled": { "type": "boolean" },
+            "last_progress_at": { "type": ["string", "null"] },
+            "last_progress_age_ms": { "type": ["integer", "null"] },
             "orphaned": { "type": "boolean" },
             "pid": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
@@ -72761,6 +72868,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
             "feature_compiled_in": { "type": "boolean" },
+            "quality_tier_published": { "type": "boolean" },
+            "semantic_only_search_available": { "type": "boolean" },
             "hint": { "type": ["string", "null"] },
             "fast_tier": {
                 "type": "object",
@@ -77639,6 +77748,10 @@ mod response_schema_tests {
         std::fs::write(path, vec![b'x'; bytes]).expect("write storage fixture file");
     }
 
+    fn path_text_ends_with_portable(path: &str, suffix: &str) -> bool {
+        path.replace('\\', "/").ends_with(suffix)
+    }
+
     #[test]
     fn doctor_storage_pressure_classifies_precious_and_reclaimable_bytes() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -77764,7 +77877,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "backup-filter-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_text_ends_with_portable(&risk.path, "raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77794,7 +77907,7 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(|risk| {
                 risk.risk_kind == "repo-ignore-excludes-cass-evidence"
-                    && risk.path.ends_with("cass-data/raw-mirror/v1")
+                    && path_text_ends_with_portable(&risk.path, "cass-data/raw-mirror/v1")
                     && risk
                         .evidence
                         .iter()
@@ -77901,14 +78014,14 @@ mod response_schema_tests {
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "cass-config-excludes-cass-evidence"
-                    && risk.path.ends_with("backups")
+                    && path_text_ends_with_portable(&risk.path, "backups")
             ),
             "cass config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );
         assert!(
             risks.iter().any(
                 |risk| risk.risk_kind == "sources-config-excludes-cass-evidence"
-                    && risk.path.ends_with("raw-mirror/v1")
+                    && path_text_ends_with_portable(&risk.path, "raw-mirror/v1")
             ),
             "sources config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
         );
@@ -78925,6 +79038,10 @@ mod stall_diagnostics_tests {
         // Caller has not touched phase/current — still 0/0.
         assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
         assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+        *progress
+            .preparation_step
+            .lock()
+            .expect("preparation step lock") = "checking_tantivy_reader".to_string();
 
         let payload = watchdog.observe(&progress, 100);
         let payload = payload.expect(
@@ -78932,6 +79049,10 @@ mod stall_diagnostics_tests {
         );
         let obj = payload.as_object().expect("event payload is an object");
         assert_eq!(obj["event"], serde_json::json!("stall_detected"));
+        assert_eq!(
+            obj["preparation_step"],
+            serde_json::json!("checking_tantivy_reader")
+        );
         assert!(
             obj.contains_key("stall_elapsed_ms"),
             "watchdog event missing stall_elapsed_ms",
@@ -90125,13 +90246,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(purge);
     }
 
-    storage.rebuild_fts().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveFtsRebuild.kind_str(),
-        message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
-        hint: Some("Run 'cass index --full' to refresh derived search data".into()),
-        retryable: false,
-    })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
@@ -90769,6 +90883,26 @@ fn run_daemon(
         kind: CliErrorKind::Daemon.kind_str(),
         message: format!("Daemon failed: {e}"),
         hint: None,
+        retryable: false,
+    })
+}
+
+/// Run the semantic model daemon (Unix only)
+#[cfg(not(unix))]
+fn run_daemon(
+    _socket: Option<PathBuf>,
+    _idle_timeout: Option<u64>,
+    _max_connections: Option<usize>,
+    _data_dir: Option<PathBuf>,
+) -> CliResult<()> {
+    Err(CliError {
+        code: 15,
+        kind: CliErrorKind::Daemon.kind_str(),
+        message: "The semantic model daemon is only supported on Unix platforms".to_string(),
+        hint: Some(
+            "On this platform, run semantic search without --daemon or use lexical fallback."
+                .to_string(),
+        ),
         retryable: false,
     })
 }

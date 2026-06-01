@@ -369,6 +369,44 @@ fn wait_for_rendered_output(
     }
 }
 
+fn latency_trace_has_visible_interaction_sample(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("samples")
+        .and_then(|samples| samples.as_array())
+        .is_some_and(|samples| {
+            samples.iter().any(|sample| {
+                sample
+                    .get("generation")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default()
+                    > 1
+                    && sample
+                        .get("input_to_first_visible_us")
+                        .and_then(|value| value.as_u64())
+                        .is_some()
+            })
+        })
+}
+
+fn wait_for_latency_trace_visible_interaction_sample(path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if latency_trace_has_visible_interaction_sample(path) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(PTY_POLL);
+    }
+}
+
 fn send_key_sequence(writer: &mut (dyn Write + Send), bytes: &[u8]) {
     writer.write_all(bytes).expect("write to PTY");
     writer.flush().expect("flush PTY");
@@ -932,15 +970,29 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after spaced query submission in PTY Enter flow"
     );
+    let saw_fixture_result_before_detail =
+        wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+            rendered_contains_hello_fixture_content(rendered)
+        });
+    assert!(
+        saw_fixture_result_before_detail,
+        "Did not observe fixture search result before spaced-query detail-open attempt"
+    );
     thread::sleep(Duration::from_millis(180));
 
     let before_open_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"\r");
-    let saw_detail = wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail_growth =
+        wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail = wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+        rendered_contains_detail_messages_marker(rendered)
+            && rendered_contains_hello_fixture_content(rendered)
+    });
     assert!(
         saw_detail,
-        "Did not observe output growth after Enter detail-open attempt for spaced query"
+        "Did not observe detail modal content after Enter detail-open attempt for spaced query"
     );
+    thread::sleep(Duration::from_millis(220));
 
     send_key_sequence(&mut *writer, b"\x1b");
     thread::sleep(Duration::from_millis(220));
@@ -970,7 +1022,9 @@ fn tui_pty_search_query_with_space_opens_detail_modal() {
     let summary = serde_json::json!({
         "trace_id": trace,
         "test": "tui_pty_search_query_with_space_opens_detail_modal",
-        "saw_detail_growth": saw_detail,
+        "saw_fixture_result_before_detail": saw_fixture_result_before_detail,
+        "saw_detail_growth": saw_detail_growth,
+        "saw_detail": saw_detail,
         "first_esc_exited": first_esc_exited,
         "total_esc_presses_to_exit": 1 + additional_esc_presses,
         "saw_messages_detail": saw_messages_detail,
@@ -1037,14 +1091,30 @@ fn tui_pty_detail_modal_shows_markdown_content() {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after markdown query submission in PTY flow"
     );
+    let saw_markdown_result =
+        wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+            let rendered_lower = rendered.to_ascii_lowercase();
+            rendered_lower.contains("show markdown sentinel sample")
+                || rendered_lower.contains("markdown sentinel alpha")
+        });
+    assert!(
+        saw_markdown_result,
+        "Did not observe markdown fixture search result before detail-open attempt"
+    );
     thread::sleep(Duration::from_millis(200));
 
     let before_open_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"\r");
-    let saw_detail = wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail_growth =
+        wait_for_output_growth(&captured, before_open_len, 8, Duration::from_secs(6));
+    let saw_detail = wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+        let rendered_lower = rendered.to_ascii_lowercase();
+        rendered_contains_detail_messages_marker(rendered)
+            && rendered_lower.contains("markdown sentinel alpha")
+    });
     assert!(
         saw_detail,
-        "Did not observe output growth after Enter detail-open attempt in markdown PTY flow"
+        "Did not observe markdown detail modal content after Enter detail-open attempt in PTY flow"
     );
     thread::sleep(Duration::from_millis(220));
 
@@ -1082,7 +1152,9 @@ fn tui_pty_detail_modal_shows_markdown_content() {
     let summary = serde_json::json!({
         "trace_id": trace,
         "test": "tui_pty_detail_modal_shows_markdown_content",
-        "saw_detail_growth": saw_detail,
+        "saw_detail_growth": saw_detail_growth,
+        "saw_detail": saw_detail,
+        "saw_markdown_result": saw_markdown_result,
         "first_esc_exited": first_esc_exited,
         "total_esc_presses_to_exit": 1 + additional_esc_presses,
         "saw_heading": saw_heading,
@@ -2442,6 +2514,12 @@ fn tui_typing_writes_latency_trace() {
         }),
         "Did not observe rendered search input before latency typing interaction"
     );
+    assert!(
+        wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |rendered| {
+            rendered.contains("Loaded") && rendered.contains("hits")
+        }),
+        "Did not observe initial search completion before latency typing interaction"
+    );
 
     let before_query_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"hello");
@@ -2449,14 +2527,14 @@ fn tui_typing_writes_latency_trace() {
         wait_for_output_growth(&captured, before_query_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after live query typing in latency PTY"
     );
-    let before_submit_len = captured.lock().expect("capture lock").len();
-    send_key_sequence(&mut *writer, b"\r");
-    thread::sleep(Duration::from_millis(120));
     assert!(
-        wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
-        "Did not observe output growth after explicit query submission in latency PTY"
+        wait_for_rendered_output(&captured, Duration::from_secs(6), |rendered| {
+            rendered.contains("hello")
+        }),
+        "Did not observe typed query in rendered latency PTY output"
     );
-    thread::sleep(Duration::from_millis(250));
+    let saw_latency_sample_before_quit =
+        wait_for_latency_trace_visible_interaction_sample(&latency_path, Duration::from_secs(8));
 
     let (status, esc_presses) =
         quit_tui_with_escape(&mut *writer, &mut *tui_child, 8, Duration::from_millis(180));
@@ -2479,6 +2557,7 @@ fn tui_typing_writes_latency_trace() {
         "trace_id": trace,
         "test": "tui_typing_writes_latency_trace",
         "esc_presses_to_exit": esc_presses,
+        "saw_latency_sample_before_quit": saw_latency_sample_before_quit,
         "captured_bytes": raw.len(),
     });
     save_artifact(

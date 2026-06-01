@@ -165,13 +165,22 @@ fn assert_message_contracts(conversation: &NormalizedConversation) {
     }
 }
 
+fn external_id_as_slash(id: &str) -> String {
+    id.replace('\\', "/")
+}
+
 fn conversation_by_external_id<'a>(
     conversations: &'a [NormalizedConversation],
     external_id: &str,
 ) -> &'a NormalizedConversation {
     conversations
         .iter()
-        .find(|conversation| conversation.external_id.as_deref() == Some(external_id))
+        .find(|conversation| {
+            conversation
+                .external_id
+                .as_deref()
+                .is_some_and(|id| external_id_as_slash(id) == external_id)
+        })
         .unwrap_or_else(|| panic!("missing conversation with external_id {external_id}"))
 }
 
@@ -209,9 +218,12 @@ fn claude_code_connector_output_conforms_to_normalized_contract() {
             source_requirement.id,
             source_requirement.description
         );
+        let external_id = conversation
+            .external_id
+            .as_deref()
+            .map(external_id_as_slash);
         assert!(
-            conversation
-                .external_id
+            external_id
                 .as_deref()
                 .is_some_and(|id| id.starts_with("projects/org/team/") && id.ends_with(".jsonl")),
             "{} {}",
