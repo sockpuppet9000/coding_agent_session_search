@@ -10745,6 +10745,98 @@ fn record_current_connector_scan_detail_stage_string(stage: String) {
     record_current_connector_scan_detail_stage_value(&stage);
 }
 
+#[derive(Clone)]
+struct ConsumerIngestTelemetryContext {
+    data_dir: PathBuf,
+    metadata_write_lock: Option<Arc<Mutex<()>>>,
+    progress_bump: Option<Arc<AtomicI64>>,
+    root: Option<PathBuf>,
+}
+
+thread_local! {
+    static CONSUMER_INGEST_TELEMETRY_CONTEXTS: RefCell<Vec<ConsumerIngestTelemetryContext>> =
+        RefCell::new(Vec::new());
+}
+
+struct ConsumerIngestTelemetryGuard;
+
+impl Drop for ConsumerIngestTelemetryGuard {
+    fn drop(&mut self) {
+        CONSUMER_INGEST_TELEMETRY_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().pop();
+        });
+    }
+}
+
+fn push_consumer_ingest_telemetry_context(
+    data_dir: PathBuf,
+    metadata_write_lock: Option<Arc<Mutex<()>>>,
+    progress_bump: Option<Arc<AtomicI64>>,
+    root: Option<PathBuf>,
+) -> ConsumerIngestTelemetryGuard {
+    CONSUMER_INGEST_TELEMETRY_CONTEXTS.with(|contexts| {
+        contexts.borrow_mut().push(ConsumerIngestTelemetryContext {
+            data_dir,
+            metadata_write_lock,
+            progress_bump,
+            root,
+        });
+    });
+    ConsumerIngestTelemetryGuard
+}
+
+fn representative_consumer_ingest_root(convs: &[NormalizedConversation]) -> Option<PathBuf> {
+    convs
+        .iter()
+        .max_by_key(|conv| conversation_batch_footprint(conv).1)
+        .map(|conv| conv.source_path.clone())
+}
+
+fn consumer_ingest_stage_name(stage_prefix: &str, convs: &[NormalizedConversation]) -> String {
+    let conversation_count = convs.len();
+    let message_count: usize = convs.iter().map(|conv| conv.messages.len()).sum();
+    let char_count: usize = convs
+        .iter()
+        .flat_map(|conv| conv.messages.iter())
+        .map(|msg| msg.content.len())
+        .sum();
+    let max_conversation_messages = convs
+        .iter()
+        .map(|conv| conv.messages.len())
+        .max()
+        .unwrap_or(0);
+    let max_conversation_chars = convs
+        .iter()
+        .map(|conv| conversation_batch_footprint(conv).1)
+        .max()
+        .unwrap_or(0);
+    format!(
+        "{stage_prefix}_convs_{conversation_count}_messages_{message_count}_chars_{char_count}_maxconvmsgs_{max_conversation_messages}_maxconvchars_{max_conversation_chars}"
+    )
+}
+
+fn record_current_consumer_ingest_stage_value(stage: &str) {
+    let context =
+        CONSUMER_INGEST_TELEMETRY_CONTEXTS.with(|contexts| contexts.borrow().last().cloned());
+    let Some(context) = context else {
+        return;
+    };
+    record_index_run_scan_state(
+        &context.data_dir,
+        context.metadata_write_lock.as_ref(),
+        context.progress_bump.as_ref(),
+        "consumer",
+        stage,
+        "ingest",
+        context.root.as_deref(),
+    );
+}
+
+fn record_current_consumer_ingest_stage(stage_prefix: &str, convs: &[NormalizedConversation]) {
+    let stage = consumer_ingest_stage_name(stage_prefix, convs);
+    record_current_consumer_ingest_stage_value(&stage);
+}
+
 fn codex_local_explicit_primary_file_roots(
     connector: &(dyn Connector + Send),
     ctx: &crate::connectors::ScanContext,
@@ -11530,7 +11622,23 @@ fn run_streaming_consumer(
 
                 // Ingest the combined batch (== original single batch when
                 // combine_enabled = false or no extras were drained).
+                let representative_ingest_root =
+                    representative_consumer_ingest_root(&combined_conversations);
+                let _consumer_ingest_telemetry_guard = if consumer_stage_telemetry_enabled {
+                    Some(push_consumer_ingest_telemetry_context(
+                        data_dir.to_path_buf(),
+                        index_run_metadata_write_lock.clone(),
+                        index_run_progress_bump.clone(),
+                        representative_ingest_root,
+                    ))
+                } else {
+                    None
+                };
                 record_consumer_limiter_stage("consumer_ingest_start");
+                record_current_consumer_ingest_stage(
+                    "consumer_ingest_batch_start",
+                    &combined_conversations,
+                );
                 let batch_outcome = ingest_non_watch_batch_with_oom_split(
                     storage,
                     t_index.as_deref_mut(),
@@ -19432,9 +19540,11 @@ fn ingest_batch_detailed(
 ) -> Result<NonWatchIngestOutcome> {
     let trace_span =
         robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
+    record_current_consumer_ingest_stage("ingest_batch_detailed_start", convs);
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
     // on older frankensqlite builds that ignore autocommit_retain.
+    record_current_consumer_ingest_stage("ingest_batch_detailed_persist_start", convs);
     let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
         storage,
         t_index,
@@ -19444,8 +19554,12 @@ fn ingest_batch_detailed(
         defer_checkpoints,
     );
     let batch_outcome = match batch_result {
-        Ok(batch_outcome) => batch_outcome,
+        Ok(batch_outcome) => {
+            record_current_consumer_ingest_stage("ingest_batch_detailed_persist_done", convs);
+            batch_outcome
+        }
         Err(error) => {
+            record_current_consumer_ingest_stage("ingest_batch_detailed_persist_error", convs);
             robot_trace_ingest_finish(trace_span, "error", 0, 0, Some(&error));
             return Err(error);
         }
@@ -19468,6 +19582,7 @@ fn ingest_batch_detailed(
         batch_outcome.inserted_messages,
         None,
     );
+    record_current_consumer_ingest_stage("ingest_batch_detailed_done", convs);
     Ok(NonWatchIngestOutcome {
         canonical_mutations: CanonicalMutationCounts {
             inserted_conversations: batch_outcome.inserted_conversations,
@@ -19492,6 +19607,7 @@ fn ingest_non_watch_batch_with_oom_split(
         return Ok(NonWatchIngestOutcome::default());
     }
 
+    record_current_consumer_ingest_stage("ingest_oom_split_enter", convs);
     let first_attempt = ingest_non_watch_batch_once(
         storage,
         t_index,
@@ -19503,17 +19619,26 @@ fn ingest_non_watch_batch_with_oom_split(
     );
 
     match first_attempt {
-        Ok(outcome) => Ok(outcome),
-        Err(error) if error_is_out_of_memory(&error) => ingest_non_watch_oom_retry_or_quarantine(
-            storage,
-            data_dir,
-            convs,
-            progress,
-            lexical_strategy,
-            defer_checkpoints,
-            error,
-        ),
-        Err(error) => Err(error),
+        Ok(outcome) => {
+            record_current_consumer_ingest_stage("ingest_oom_split_done", convs);
+            Ok(outcome)
+        }
+        Err(error) if error_is_out_of_memory(&error) => {
+            record_current_consumer_ingest_stage("ingest_oom_split_oom", convs);
+            ingest_non_watch_oom_retry_or_quarantine(
+                storage,
+                data_dir,
+                convs,
+                progress,
+                lexical_strategy,
+                defer_checkpoints,
+                error,
+            )
+        }
+        Err(error) => {
+            record_current_consumer_ingest_stage("ingest_oom_split_error", convs);
+            Err(error)
+        }
     }
 }
 
@@ -19527,10 +19652,12 @@ fn ingest_non_watch_batch_once(
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
 ) -> Result<NonWatchIngestOutcome> {
+    record_current_consumer_ingest_stage("ingest_once_start", convs);
     if should_inject_non_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
+        record_current_consumer_ingest_stage("ingest_once_test_oom", convs);
         return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
     }
 
@@ -19549,6 +19676,7 @@ fn ingest_non_watch_batch_once(
         "index-ingest-out-of-memory",
         convs,
     );
+    record_current_consumer_ingest_stage("ingest_once_done", convs);
     Ok(outcome)
 }
 
@@ -22745,7 +22873,10 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 }
 
 pub mod persist {
-    use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
+    use super::{
+        LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy,
+        record_current_consumer_ingest_stage,
+    };
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
@@ -23572,9 +23703,14 @@ pub mod persist {
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
     ) -> Result<PersistBatchOutcome> {
+        record_current_consumer_ingest_stage("persist_begin_concurrent_start", convs);
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
+            record_current_consumer_ingest_stage(
+                "persist_begin_concurrent_missing_tantivy_error",
+                convs,
+            );
             anyhow::bail!(
                 "begin-concurrent batched persistence requires a Tantivy writer for {}",
                 lexical_strategy.as_str()
@@ -23590,6 +23726,7 @@ pub mod persist {
         // allocator work out of every writer's retry window — so conflict
         // retries re-run only SQLite I/O, not the allocation cost. See the
         // matching hoist in the serial persist_conversations_batched path.
+        record_current_consumer_ingest_stage("persist_begin_concurrent_map_start", convs);
         let internal_convs: Vec<Conversation> = convs
             .par_iter()
             .map_init(
@@ -23597,7 +23734,9 @@ pub mod persist {
                 |redactor, conv| map_to_internal_with_redactor(conv, Some(redactor)),
             )
             .collect();
+        record_current_consumer_ingest_stage("persist_begin_concurrent_map_done", convs);
 
+        record_current_consumer_ingest_stage("persist_begin_concurrent_chunks_start", convs);
         let indexed_chunks: Vec<Result<ChunkPersistResult>> = convs
             .par_chunks(chunk_size)
             .enumerate()
@@ -23667,6 +23806,7 @@ pub mod persist {
                 }
             })
             .collect();
+        record_current_consumer_ingest_stage("persist_begin_concurrent_chunks_done", convs);
 
         let mut ordered = Vec::with_capacity(convs.len());
         let mut fallback_ranges = Vec::new();
@@ -23693,6 +23833,10 @@ pub mod persist {
         }
 
         for remaining_range in fallback_ranges {
+            record_current_consumer_ingest_stage(
+                "persist_begin_concurrent_fallback_start",
+                &convs[remaining_range.clone()],
+            );
             let fallback_outcomes = persist_chunk_serial_fallback(
                 db_path,
                 remaining_range.start,
@@ -23702,28 +23846,46 @@ pub mod persist {
                 defer_checkpoints,
             )?;
             ordered.extend(fallback_outcomes);
+            record_current_consumer_ingest_stage(
+                "persist_begin_concurrent_fallback_done",
+                &convs[remaining_range],
+            );
         }
         ordered.sort_by_key(|(idx, _)| *idx);
         if let Some(data_dir) = raw_mirror_data_dir {
+            record_current_consumer_ingest_stage(
+                "persist_begin_concurrent_raw_mirror_start",
+                convs,
+            );
             for (idx, outcome) in &ordered {
                 if let Some(conv) = convs.get(*idx) {
                     record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
                 }
             }
+            record_current_consumer_ingest_stage("persist_begin_concurrent_raw_mirror_done", convs);
         }
 
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
 
+        record_current_consumer_ingest_stage("persist_begin_concurrent_lexical_start", convs);
         let mut skip_inline_lexical_updates = false;
         for (idx, outcome) in ordered {
             let conv = &convs[idx];
             batch_outcome.record_insert_outcome(&outcome);
             if defer_lexical_updates || skip_inline_lexical_updates {
                 if capture_semantic_delta {
+                    record_current_consumer_ingest_stage(
+                        "persist_begin_concurrent_semantic_delta_start",
+                        std::slice::from_ref(conv),
+                    );
                     let (inputs, max_message_id) =
                         packet_semantic_delta_for_outcome(storage, &outcome)?;
                     batch_outcome.extend_semantic_delta(inputs, max_message_id);
+                    record_current_consumer_ingest_stage(
+                        "persist_begin_concurrent_semantic_delta_done",
+                        std::slice::from_ref(conv),
+                    );
                 }
                 continue;
             }
@@ -23784,12 +23946,22 @@ pub mod persist {
             }
 
             if capture_semantic_delta {
+                record_current_consumer_ingest_stage(
+                    "persist_begin_concurrent_semantic_delta_start",
+                    std::slice::from_ref(conv),
+                );
                 let (inputs, max_message_id) =
                     packet_semantic_delta_for_outcome(storage, &outcome)?;
                 batch_outcome.extend_semantic_delta(inputs, max_message_id);
+                record_current_consumer_ingest_stage(
+                    "persist_begin_concurrent_semantic_delta_done",
+                    std::slice::from_ref(conv),
+                );
             }
         }
+        record_current_consumer_ingest_stage("persist_begin_concurrent_lexical_done", convs);
 
+        record_current_consumer_ingest_stage("persist_begin_concurrent_done", convs);
         Ok(batch_outcome)
     }
 
@@ -24117,9 +24289,11 @@ pub mod persist {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
+        record_current_consumer_ingest_stage("persist_inner_start", convs);
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
+            record_current_consumer_ingest_stage("persist_inner_missing_tantivy_error", convs);
             anyhow::bail!(
                 "batched persistence requires a Tantivy writer for {}",
                 lexical_strategy.as_str()
@@ -24138,7 +24312,8 @@ pub mod persist {
                 conversations = convs.len(),
                 "using begin-concurrent write path for indexing"
             );
-            return persist_conversations_batched_begin_concurrent(
+            record_current_consumer_ingest_stage("persist_inner_begin_concurrent_start", convs);
+            let result = persist_conversations_batched_begin_concurrent(
                 storage,
                 &db_path,
                 t_index,
@@ -24148,6 +24323,12 @@ pub mod persist {
                 capture_semantic_delta,
                 raw_mirror_data_dir,
             );
+            if result.is_ok() {
+                record_current_consumer_ingest_stage("persist_inner_begin_concurrent_done", convs);
+            } else {
+                record_current_consumer_ingest_stage("persist_inner_begin_concurrent_error", convs);
+            }
+            return result;
         }
 
         if duplicate_keys_present {
@@ -24165,6 +24346,7 @@ pub mod persist {
         // shortens the serial writer-hold window and exploits headroom on
         // many-core hosts. This is the hot path for ingest batches.
         use rayon::prelude::*;
+        record_current_consumer_ingest_stage("persist_inner_map_start", convs);
         let internal_convs: Vec<Conversation> = convs
             .par_iter()
             .map_init(
@@ -24172,8 +24354,10 @@ pub mod persist {
                 |redactor, conv| map_to_internal_with_redactor(conv, Some(redactor)),
             )
             .collect();
+        record_current_consumer_ingest_stage("persist_inner_map_done", convs);
 
-        let outcomes = with_ephemeral_writer(
+        record_current_consumer_ingest_stage("persist_inner_writer_start", convs);
+        let outcomes_result = with_ephemeral_writer(
             storage,
             defer_checkpoints,
             "serial batched indexing",
@@ -24238,16 +24422,29 @@ pub mod persist {
 
                 Ok(outcomes)
             },
-        )?;
+        );
+        let outcomes = match outcomes_result {
+            Ok(outcomes) => {
+                record_current_consumer_ingest_stage("persist_inner_writer_done", convs);
+                outcomes
+            }
+            Err(error) => {
+                record_current_consumer_ingest_stage("persist_inner_writer_error", convs);
+                return Err(error);
+            }
+        };
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
+        record_current_consumer_ingest_stage("persist_inner_raw_mirror_start", convs);
         record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
+        record_current_consumer_ingest_stage("persist_inner_raw_mirror_done", convs);
         if !defer_lexical_updates {
             // ibuuh.32 / 5b9p0: route the serial-batched lexical sink
             // through the packet pipeline. Build each packet ONCE and
             // reuse it for both InlineRebuildFromScan (full message
             // set) and IncrementalInline (positional subset derived
             // from outcome.inserted_indices).
+            record_current_consumer_ingest_stage("persist_inner_lexical_start", convs);
             let mut skip_inline_lexical_updates = false;
             for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
                 batch_outcome.record_insert_outcome(outcome);
@@ -24304,19 +24501,24 @@ pub mod persist {
                     }
                 }
             }
+            record_current_consumer_ingest_stage("persist_inner_lexical_done", convs);
         } else {
+            record_current_consumer_ingest_stage("persist_inner_lexical_deferred", convs);
             for outcome in &outcomes {
                 batch_outcome.record_insert_outcome(outcome);
             }
         }
 
         if capture_semantic_delta {
+            record_current_consumer_ingest_stage("persist_inner_semantic_delta_start", convs);
             for outcome in outcomes.iter() {
                 let (inputs, max_message_id) = packet_semantic_delta_for_outcome(storage, outcome)?;
                 batch_outcome.extend_semantic_delta(inputs, max_message_id);
             }
+            record_current_consumer_ingest_stage("persist_inner_semantic_delta_done", convs);
         }
 
+        record_current_consumer_ingest_stage("persist_inner_done", convs);
         Ok(batch_outcome)
     }
 
