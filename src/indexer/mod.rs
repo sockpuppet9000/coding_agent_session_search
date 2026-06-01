@@ -2208,6 +2208,8 @@ fn try_readonly_canonical_force_rebuild(
             observed_messages,
         );
     }
+    let now_ms = FrankenStorage::now_millis();
+    persist_final_index_run_metadata_from_fresh_storage(&opts.db_path, false, now_ms, now_ms)?;
     Ok(true)
 }
 
@@ -9239,6 +9241,43 @@ fn persist_final_index_run_metadata(
     )
 }
 
+fn persist_final_index_run_metadata_from_fresh_storage(
+    db_path: &Path,
+    performed_scan: bool,
+    scan_start_ts: i64,
+    now_ms: i64,
+) -> Result<()> {
+    persist_final_index_run_metadata_with_writer(
+        db_path,
+        performed_scan,
+        scan_start_ts,
+        now_ms,
+        || {
+            let mut storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                db_path,
+                Duration::from_secs(10),
+            )?;
+            persist::apply_index_writer_busy_timeout(&storage);
+            let result =
+                persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+                    persist::with_ephemeral_writer(
+                        &storage,
+                        false,
+                        "updating final index run metadata",
+                        |writer| {
+                            if performed_scan {
+                                writer.set_last_scan_ts(scan_start_ts)?;
+                            }
+                            writer.set_last_indexed_at(now_ms)
+                        },
+                    )
+                });
+            storage.close_best_effort_in_place();
+            result
+        },
+    )
+}
+
 /// Bead zz8ni: the expensive index + lexical rebuild work above this call
 /// has already been committed durably. The `last_indexed_at` /
 /// `last_scan_ts` markers are status-display metadata — losing the writer
@@ -11397,6 +11436,13 @@ pub fn run_index(
                         observed_messages,
                     );
                 }
+                let now_ms = FrankenStorage::now_millis();
+                persist_final_index_run_metadata_from_fresh_storage(
+                    &opts.db_path,
+                    false,
+                    now_ms,
+                    now_ms,
+                )?;
                 return Ok(());
             }
             Ok(None) => {}
@@ -35122,6 +35168,38 @@ mod tests {
     }
 
     #[test]
+    fn readonly_canonical_force_rebuild_updates_indexed_marker_without_scan_watermark() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+        opts.force_rebuild = true;
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        storage.set_last_scan_ts(123).unwrap();
+        storage.set_last_indexed_at(111).unwrap();
+        drop(storage);
+
+        assert!(
+            try_readonly_canonical_force_rebuild(&opts, &Arc::new(AtomicI64::new(0))).unwrap(),
+            "populated canonical DB should take the read-only force-rebuild path"
+        );
+
+        let storage = FrankenStorage::open_readonly(&opts.db_path).unwrap();
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(123),
+            "lexical-only DB-authoritative rebuilds must not advance the source scan watermark"
+        );
+        assert!(
+            storage.get_last_indexed_at().unwrap().unwrap() > 111,
+            "read-only lexical rebuild must refresh search freshness metadata"
+        );
+    }
+
+    #[test]
     fn absent_explicit_watch_once_paths_skip_heavy_index_setup() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -43865,6 +43943,26 @@ mod tests {
         persist_final_index_run_metadata(&storage, &db_path, false, 999, 456).unwrap();
 
         assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
+        assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
+    }
+
+    #[test]
+    fn persist_final_index_run_metadata_from_fresh_storage_updates_lexical_resume_marker() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.set_last_scan_ts(123).unwrap();
+        storage.set_last_indexed_at(111).unwrap();
+        drop(storage);
+
+        persist_final_index_run_metadata_from_fresh_storage(&db_path, false, 999, 456).unwrap();
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(123),
+            "lexical-only DB-authoritative rebuilds must not advance the source scan watermark"
+        );
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
     }
 
