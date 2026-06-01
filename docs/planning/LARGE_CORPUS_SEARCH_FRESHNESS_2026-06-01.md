@@ -44,6 +44,15 @@ scan watermarks are not advanced by derived-index maintenance.
 This fixes future runs. It does not mutate an existing live archive until a
 normal index/maintenance command is run deliberately.
 
+Follow-up: a later live check proved there is another valid source of freshness
+truth. The local archive had a completed lexical checkpoint at
+`2026-06-01T11:33:55.164Z` while the canonical DB still stored
+`meta.last_indexed_at=2026-05-29T23:38:11.493Z`. Status/search metadata now
+uses a completed checkpoint for the active DB as the effective lexical
+`last_indexed_at` when it is newer than the DB marker, and search-triggered
+lexical repairs now refresh DB metadata after rebuilding from the canonical DB.
+Direct Doctor and archive-purge rebuild callers do the same.
+
 ## Verification
 
 Passed locally with `RUSTUP_TOOLCHAIN=nightly` and
@@ -55,6 +64,34 @@ Passed locally with `RUSTUP_TOOLCHAIN=nightly` and
 - `git diff --check`
 - `cargo check --all-targets`
 
+Additional follow-up verification:
+
+- `cargo test --lib search::asset_state::tests::lexical_state_uses_completed_checkpoint_timestamp_when_db_marker_lags -- --exact`
+- `cargo test --lib search_lexical_self_heal_tests::search_self_heal_rebuilds_missing_lexical_index_from_canonical_db -- --exact`
+- `cargo test --lib indexer::tests::persist_final_index_run_metadata_from_fresh_storage_updates_lexical_resume_marker -- --exact`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --all-targets`
+- `cargo build --release`
+
+Live read-only verification with the explicit rebuilt binary showed:
+
+- `cass health --json` now reports the completed checkpoint timestamp
+  `2026-06-01T11:33:55.164Z` instead of the old DB marker, but remains stale
+  under the 300 second health threshold once that checkpoint is older than five
+  minutes.
+- `cass search ... --robot-meta --timeout 60000` for
+  `019e6f57-0e03-75a3-acda-338c6de08aaa` returned successfully in about 6.3s;
+  search metadata reported lexical `status=ready`, `fresh=true`,
+  `pending_sessions=0`, and the same completed checkpoint timestamp under the
+  search surface's 1800 second freshness threshold.
+- The canonical DB row is still old until a deliberate maintenance/index run:
+  `last_indexed_at=1780097891493`, `last_scan_ts=1780089414052`.
+- `cass status --json` did not return within roughly 90s and was terminated;
+  `cass health` also reported an existing Doctor repair lock. That status /
+  Doctor-summary path is a separate follow-up, not this freshness reconciliation
+  fix.
+
 `rch` was not available in this local environment, so the broad compile check
 was run locally instead of via remote compute.
 
@@ -65,6 +102,10 @@ was run locally instead of via remote compute.
 - Re-run `cass health --json` and `cass search --robot-meta` against the same
   explicit binary and data dir; their `last_indexed_at`/checkpoint view should
   converge.
+- Diagnose the slow `cass status --json` / Doctor repair-lock path. The local
+  `doctor/locks/doctor-repair.lock` file exists from 2026-05-30, no active
+  `cass` process was observed during the follow-up check, and no cleanup was
+  performed in this work block.
 - Re-test the target ChatGPT import corpus
   `019e6f57-0e03-75a3-acda-338c6de08aaa` and distinguish weak rollout-reference
   hits from actual imported ChatGPT conversation hits.

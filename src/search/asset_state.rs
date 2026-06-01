@@ -1344,6 +1344,19 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     // forced into second-bin alignment. `as u64` is correct because
     // wall-clock millis fits well inside i63 (until year ~292477).
     let now_secs: u64 = now_ms.div_euclid(1000).max(0) as u64;
+    let completed_checkpoint_covers_current_db = checkpoint.is_some_and(|state| state.completed)
+        && checkpoint_db_matches == Some(true)
+        && schema_matches == Some(true)
+        && page_size_compatible == Some(true)
+        && fingerprint_matches != Some(false);
+    let completed_checkpoint_updated_at_ms = checkpoint
+        .filter(|_| completed_checkpoint_covers_current_db)
+        .and_then(|state| (state.updated_at_ms > 0).then_some(state.updated_at_ms));
+    let last_indexed_at_ms = match (last_indexed_at_ms, completed_checkpoint_updated_at_ms) {
+        (Some(indexed_at), Some(checkpoint_at)) => Some(indexed_at.max(checkpoint_at)),
+        (None, Some(checkpoint_at)) => Some(checkpoint_at),
+        (existing, None) => existing,
+    };
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
     let age_stale = match age_seconds {
@@ -2387,6 +2400,48 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("different database"))
         );
+    }
+
+    #[test]
+    fn lexical_state_uses_completed_checkpoint_timestamp_when_db_marker_lags() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "fresh-fingerprint".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_120_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_121_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("fresh-fingerprint"),
+        });
+
+        assert_eq!(state.status, "ready");
+        assert!(state.fresh);
+        assert!(!state.stale);
+        assert_eq!(state.last_indexed_at_ms, Some(1_733_000_120_000));
+        assert_eq!(state.age_seconds, Some(1));
+        assert_eq!(state.pending_sessions, 0);
     }
 
     #[test]

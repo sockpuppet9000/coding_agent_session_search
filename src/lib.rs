@@ -15860,6 +15860,7 @@ fn state_meta_json_inner(
             },
         }
     });
+    last_indexed_at = assets.lexical.last_indexed_at_ms;
     if !assets.lexical.rebuilding
         && last_scan_ts.is_some_and(|scan_ts| {
             last_indexed_at
@@ -19014,6 +19015,15 @@ mod search_lexical_self_heal_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen canonical db");
+            storage
+                .set_last_scan_ts(1_770_000_000_000)
+                .expect("set scan ts");
+            storage
+                .set_last_indexed_at(1)
+                .expect("set stale indexed marker");
+        }
         let index_path = crate::search::tantivy::expected_index_dir(data_dir);
         assert!(!crate::search::tantivy::searchable_index_exists(
             &index_path
@@ -19031,6 +19041,18 @@ mod search_lexical_self_heal_tests {
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
         assert!(crate::search::tantivy::searchable_index_exists(&index_path));
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen repaired db");
+            assert!(
+                storage.get_last_indexed_at().expect("read indexed marker") > Some(1),
+                "search-triggered lexical repair must advance last_indexed_at"
+            );
+            assert_eq!(
+                storage.get_last_scan_ts().expect("read scan marker"),
+                Some(1_770_000_000_000),
+                "search-triggered lexical repair must not advance last_scan_ts"
+            );
+        }
 
         let client = SearchClient::open(&index_path, Some(&db_path))
             .expect("open search client")
@@ -69334,6 +69356,21 @@ pub(crate) fn run_doctor_impl(
 
             match rebuild_result {
                 Ok(message_count) => {
+                    crate::indexer::refresh_final_index_run_metadata_after_lexical_rebuild(
+                        &db_path,
+                    )
+                    .map_err(|err| CliError {
+                        code: 5,
+                        kind: CliErrorKind::LexicalRebuild.kind_str(),
+                        message: format!(
+                            "Rebuilt search index but failed to refresh lexical freshness metadata: {err:#}"
+                        ),
+                        hint: Some(
+                            "Run 'cass index' to refresh lexical search status metadata"
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    })?;
                     needs_rebuild = false;
                     auto_fix_actions.push("Rebuilt search index from database".to_string());
                     auto_fix_applied = true;
@@ -90226,6 +90263,17 @@ fn purge_excluded_agent_archive_data(
             hint: Some("Run 'cass index --full' to refresh lexical search data".into()),
             retryable: false,
         })?;
+    crate::indexer::refresh_final_index_run_metadata_after_lexical_rebuild(&db_path).map_err(
+        |e| CliError {
+            code: 5,
+            kind: CliErrorKind::LexicalRebuild.kind_str(),
+            message: format!(
+                "Purged '{archive_agent_slug}' but failed to refresh lexical freshness metadata: {e}"
+            ),
+            hint: Some("Run 'cass index' to refresh lexical search status metadata".into()),
+            retryable: true,
+        },
+    )?;
 
     Ok(purge)
 }

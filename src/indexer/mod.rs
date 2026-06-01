@@ -9278,6 +9278,11 @@ fn persist_final_index_run_metadata_from_fresh_storage(
     )
 }
 
+pub(crate) fn refresh_final_index_run_metadata_after_lexical_rebuild(db_path: &Path) -> Result<()> {
+    let now_ms = FrankenStorage::now_millis();
+    persist_final_index_run_metadata_from_fresh_storage(db_path, false, now_ms, now_ms)
+}
+
 /// Bead zz8ni: the expensive index + lexical rebuild work above this call
 /// has already been committed durably. The `last_indexed_at` /
 /// `last_scan_ts` markers are status-display metadata — losing the writer
@@ -14368,6 +14373,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
                 db_path.display()
             )
         })?;
+        refresh_final_index_run_metadata_after_lexical_rebuild(db_path)?;
         return Ok(SearchLexicalRepairOutcome { indexed_docs: 0 });
     }
     storage.close_without_checkpoint().with_context(|| {
@@ -14384,6 +14390,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         progress,
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     )?;
+    refresh_final_index_run_metadata_after_lexical_rebuild(db_path)?;
     Ok(SearchLexicalRepairOutcome {
         indexed_docs: rebuild.indexed_docs,
     })
