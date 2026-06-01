@@ -37,11 +37,28 @@ pub use franken_agent_detection::{
     file_modified_since,
     flatten_content,
     franken_detection_for_connector,
-    get_connector_factories,
     normalize_model,
     parse_timestamp,
     reindex_messages,
 };
+
+/// Get all connector factories compiled into this build.
+///
+/// Start from `franken_agent_detection` so the feature-gated connector set
+/// stays aligned with the pinned dependency, then replace connectors where CASS
+/// intentionally carries local behavior on top of the shared implementation.
+#[must_use]
+pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
+    let mut factories = franken_agent_detection::get_connector_factories();
+    for (name, factory) in &mut factories {
+        match *name {
+            "codex" => *factory = || Box::new(codex::CodexConnector::new()),
+            "chatgpt" => *factory = || Box::new(chatgpt::ChatGptConnector::new()),
+            _ => {}
+        }
+    }
+    factories
+}
 
 /// Result of a Codex scan-root preflight. The preflight replaces directory
 /// roots with explicit rollout files while preserving each root's provenance
@@ -218,3 +235,21 @@ pub mod opencode;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connector_factories_use_cass_chatgpt_streaming_wrapper() {
+        let factory = get_connector_factories()
+            .into_iter()
+            .find_map(|(name, factory)| (name == "chatgpt").then_some(factory))
+            .expect("chatgpt factory should be compiled into the default CASS build");
+        let connector = factory();
+        assert!(
+            connector.supports_streaming_scan(),
+            "CASS must use its local ChatGPT wrapper so large ChatGPT imports do not fall back to FAD's buffered default scan"
+        );
+    }
+}
