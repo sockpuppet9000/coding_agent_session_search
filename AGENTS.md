@@ -68,6 +68,29 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
+### Local Codex build wrapper
+
+On this machine, Codex agents MUST invoke CASS Cargo builds, checks, tests, and
+fmt through `cass-cargo-ssd` instead of raw `cargo`. The wrapper keeps
+`CARGO_HOME` and the shared target directory on the external VP4300 SSD, which
+avoids rebuilding large CASS dependencies in the repo-local target dir and
+keeps local Codex runs from churning the internal disk.
+
+Use:
+
+```bash
+RUSTUP_TOOLCHAIN=nightly cass-cargo-ssd fmt --check
+RUSTUP_TOOLCHAIN=nightly cass-cargo-ssd test --lib some_test_name
+RUSTUP_TOOLCHAIN=nightly cass-cargo-ssd check --all-targets
+RUSTUP_TOOLCHAIN=nightly cass-cargo-ssd build --release
+```
+
+The wrapper currently lives at `/Users/seitz/.local/bin/cass-cargo-ssd` and
+delegates to `/Volumes/VP4300-2TB/cass-recovery/bin/cass-cargo-ssd`.
+For profiling that needs debug symbols, still use this wrapper, but choose an
+appropriate profile or override the wrapper's debug-stripping environment
+deliberately.
+
 - **Edition:** Rust 2024 (stable — see `rust-toolchain.toml`)
 - **Dependency versions:** Wildcard constraints (`*`) for all crates
 - **Configuration:** Cargo.toml only (single-crate project, no workspace)
