@@ -313,9 +313,10 @@ QUERY
 
 `--query-stdin` accepts at most 64 KiB, rejects invalid UTF-8 and NUL bytes,
 and ignores terminal line endings. It is mutually exclusive with the normal
-positional `QUERY` argument. This protects the query from `argv`/`ps`; callers
-must still avoid persisting the query or returned snippets in their own logs.
-For genuinely private automation, provide stdin from an in-memory or
+positional `QUERY` argument. This keeps the query out of `argv`/`ps`; normal
+result envelopes retain their existing `query` field, so callers must still
+avoid persisting the response or returned snippets in their own logs. For
+genuinely private automation, provide stdin from an in-memory or
 descriptor-backed caller rather than embedding the query in shell history.
 
 ### 🎯 Advanced Search Features
