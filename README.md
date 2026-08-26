@@ -300,6 +300,24 @@ cass search "how to handle user login" --mode semantic --robot
 cass search "auth error handling" --mode hybrid --robot
 ```
 
+#### Private query transport
+
+Integrations that must not expose private query text in a process listing can
+feed one UTF-8 query through standard input:
+
+```bash
+cass search --query-stdin --robot --limit 5 <<'QUERY'
+authentication error
+QUERY
+```
+
+`--query-stdin` accepts at most 64 KiB, rejects invalid UTF-8 and NUL bytes,
+and ignores terminal line endings. It is mutually exclusive with the normal
+positional `QUERY` argument. This protects the query from `argv`/`ps`; callers
+must still avoid persisting the query or returned snippets in their own logs.
+For genuinely private automation, provide stdin from an in-memory or
+descriptor-backed caller rather than embedding the query in shell history.
+
 ### 🎯 Advanced Search Features
 - **Wildcard Patterns**: Full glob-style pattern support:
   - `foo*` - Prefix match (finds "foobar", "foo123")
@@ -2673,6 +2691,7 @@ cass index [--full] [--watch] [--data-dir DIR] [--idempotency-key KEY]
 
 # Search
 cass search "query" --robot --limit 5 [--timeout 5000] [--explain] [--dry-run]
+cass search --query-stdin --robot --limit 5
 cass search "error" --robot --aggregate agent,workspace --fields minimal
 cass pack "query" --robot --max-tokens 12000 [--limit 40] [--sessions-from FILE|-]
 cass pack "query" --robot --freshness-policy strict --freshness-window-seconds 604800 --require-evidence

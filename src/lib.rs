@@ -97,6 +97,13 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 const CONTRACT_VERSION: &str = "1";
 const DEFAULT_STALE_THRESHOLD_SECS: u64 = 1800;
 const DEFAULT_PACK_FRESHNESS_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+/// Maximum query payload accepted by the argv-free search transport.
+///
+/// This is intentionally small enough for an interactive search request and
+/// large enough for the normal query language. Keeping the bound here also
+/// prevents a pipe-fed caller from turning `cass search --query-stdin` into an
+/// unbounded memory sink.
+const MAX_QUERY_STDIN_BYTES: usize = 64 * 1024;
 
 /// Install rustls's `ring` crypto provider as the process default.
 ///
@@ -468,8 +475,19 @@ pub enum Commands {
     },
     /// Run a one-off search and print results to stdout
     Search {
-        /// The query string
-        query: String,
+        /// The query string. Omit this when using --query-stdin.
+        #[arg(
+            value_name = "QUERY",
+            required_unless_present = "query_stdin",
+            conflicts_with = "query_stdin"
+        )]
+        query: Option<String>,
+        /// Read the UTF-8 query from stdin instead of exposing it in argv.
+        /// This is intended for local wrappers and control-plane adapters.
+        /// The input is bounded to 64 KiB and terminal line endings are
+        /// ignored. The query is never echoed by the CLI.
+        #[arg(long, default_value_t = false)]
+        query_stdin: bool,
         /// Filter by agent slug (can be specified multiple times)
         #[arg(long)]
         agent: Vec<String>,
@@ -6489,6 +6507,52 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
     })
 }
 
+fn parse_query_stdin_bytes(bytes: &[u8]) -> CliResult<String> {
+    if bytes.len() > MAX_QUERY_STDIN_BYTES {
+        return Err(CliError::usage(
+            format!(
+                "query from stdin exceeds the {}-byte limit",
+                MAX_QUERY_STDIN_BYTES
+            ),
+            Some("send a shorter query or use the normal QUERY argument".to_string()),
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        CliError::usage(
+            "query from stdin must be valid UTF-8",
+            Some("send UTF-8 text without binary bytes".to_string()),
+        )
+    })?;
+    if text.contains('\0') {
+        return Err(CliError::usage(
+            "query from stdin must not contain NUL bytes",
+            Some("send plain UTF-8 query text".to_string()),
+        ));
+    }
+    let query = text.trim_end_matches(['\r', '\n']);
+    if query.trim().is_empty() {
+        return Err(CliError::usage(
+            "query from stdin must contain text",
+            Some("send a non-empty query".to_string()),
+        ));
+    }
+    Ok(query.to_string())
+}
+
+fn read_query_from_stdin() -> CliResult<String> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take((MAX_QUERY_STDIN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            CliError::usage(
+                "could not read query from stdin",
+                Some("send a UTF-8 query on standard input".to_string()),
+            )
+        })?;
+    parse_query_stdin_bytes(&bytes)
+}
+
 pub async fn run() -> CliResult<()> {
     let parsed = parse_cli(std::env::args().collect())?;
     run_with_parsed(parsed).await
@@ -6915,6 +6979,7 @@ async fn execute_cli(
                 }
                 Commands::Search {
                     query,
+                    query_stdin,
                     agent,
                     workspace,
                     limit,
@@ -6953,6 +7018,23 @@ async fn execute_cli(
                     quality_only,
                     refresh,
                 } => {
+                    let query = match (query, query_stdin) {
+                        (Some(_), true) => {
+                            return Err(CliError::usage(
+                                "query and --query-stdin are mutually exclusive",
+                                Some("omit QUERY when reading the query from stdin".to_string()),
+                            ));
+                        }
+                        (Some(query), false) => query,
+                        (None, true) => read_query_from_stdin()?,
+                        (None, false) => {
+                            return Err(CliError::usage(
+                                "a query is required",
+                                Some("provide QUERY or use --query-stdin".to_string()),
+                            ));
+                        }
+                    };
+
                     // Validate mutually exclusive two-tier flags
                     let tier_count = [two_tier, fast_only, quality_only]
                         .iter()
@@ -110394,6 +110476,60 @@ mod subcommand_robot_output_tests {
                 panic!("expected search command without refresh");
             };
             assert!(!refresh, "refresh should stay opt-in");
+        });
+    }
+}
+
+#[cfg(test)]
+mod query_stdin_tests {
+    use super::*;
+
+    #[test]
+    fn query_stdin_is_parsed_without_terminal_line_ending() {
+        assert_eq!(
+            parse_query_stdin_bytes(b"private phrase\r\n").expect("valid query"),
+            "private phrase"
+        );
+    }
+
+    #[test]
+    fn query_stdin_rejects_empty_or_binary_input_without_echoing_it() {
+        let empty = parse_query_stdin_bytes(b" \n").expect_err("empty query should fail");
+        assert_eq!(empty.code, 2);
+        assert!(empty.message.contains("must contain text"));
+
+        let binary = parse_query_stdin_bytes(b"safe\0secret").expect_err("NUL should fail");
+        assert_eq!(binary.code, 2);
+        assert!(binary.message.contains("must not contain NUL"));
+        assert!(!binary.message.contains("secret"));
+    }
+
+    #[test]
+    fn query_stdin_rejects_oversized_input() {
+        let oversized = vec![b'x'; MAX_QUERY_STDIN_BYTES + 1];
+        let error = parse_query_stdin_bytes(&oversized).expect_err("oversized query should fail");
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("exceeds"));
+    }
+
+    #[test]
+    fn query_stdin_flag_replaces_the_positional_query() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from(["cass", "search", "--query-stdin", "--json"])
+                .expect("stdin query should not require positional query");
+            let Some(Commands::Search {
+                query, query_stdin, ..
+            }) = cli.command
+            else {
+                panic!("expected search command");
+            };
+            assert!(query.is_none());
+            assert!(query_stdin);
+
+            let conflict =
+                Cli::try_parse_from(["cass", "search", "private phrase", "--query-stdin"])
+                    .expect_err("positional query and stdin query should conflict");
+            assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
         });
     }
 }
