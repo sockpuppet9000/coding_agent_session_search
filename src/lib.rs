@@ -381,6 +381,11 @@ pub enum Commands {
         /// ignored. The query is never echoed by the CLI.
         #[arg(long, default_value_t = false)]
         query_stdin: bool,
+        /// Read only the already published lexical assets. Never run the
+        /// optional inline refresh or the search self-heal path; return a
+        /// retryable error when freshness cannot be proven.
+        #[arg(long, default_value_t = false, conflicts_with = "refresh")]
+        no_refresh: bool,
         /// Filter by agent slug (can be specified multiple times)
         #[arg(long)]
         agent: Vec<String>,
@@ -6072,6 +6077,7 @@ async fn execute_cli(
                 Commands::Search {
                     query,
                     query_stdin,
+                    no_refresh,
                     agent,
                     workspace,
                     limit,
@@ -6228,6 +6234,7 @@ async fn execute_cli(
                         explain,
                         dry_run,
                         timeout,
+                        no_refresh,
                         highlight,
                         source,
                         sessions_from,
@@ -18841,6 +18848,76 @@ fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliEr
     }
 }
 
+fn search_no_refresh_lock_busy_error(data_dir: &Path) -> CliError {
+    CliError {
+        code: 7,
+        kind: CliErrorKind::IndexBusy.kind_str(),
+        message: format!(
+            "cass cannot prove a stable lexical snapshot because an index run is active in {}",
+            data_dir.display()
+        ),
+        hint: Some(
+            "Retry after the active index run finishes; --no-refresh never waits or repairs derived assets."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn search_no_refresh_unavailable_error(index_path: &Path, reason: &str) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::LexicalRebuild.kind_str(),
+        message: format!(
+            "--no-refresh refused search because the lexical assets at {} are not proven current: {}",
+            index_path.display(),
+            reason
+        ),
+        hint: Some(
+            "Run the bounded index/repair operation explicitly, then retry the read-only search."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn ensure_lexical_assets_for_search_no_refresh(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+) -> CliResult<SearchLexicalSelfHeal> {
+    if !db_path.exists() {
+        return Err(CliError {
+            code: 3,
+            kind: CliErrorKind::MissingDb.kind_str(),
+            message: format!(
+                "--no-refresh requires the canonical archive database at {}",
+                db_path.display()
+            ),
+            hint: Some(
+                "Restore or explicitly build the canonical archive before a read-only search."
+                    .to_string(),
+            ),
+            retryable: true,
+        });
+    }
+    if probe_index_run_lock(data_dir, db_path).active {
+        return Err(search_no_refresh_lock_busy_error(data_dir));
+    }
+
+    let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
+        if probe_index_run_lock(data_dir, db_path).active {
+            return Err(search_no_refresh_lock_busy_error(data_dir));
+        }
+        return Ok(SearchLexicalSelfHeal::skipped());
+    };
+
+    Err(search_no_refresh_unavailable_error(
+        index_path,
+        &diagnosis.reason,
+    ))
+}
+
 fn ensure_lexical_assets_for_search(
     data_dir: &Path,
     db_path: &Path,
@@ -19156,6 +19233,95 @@ mod search_lexical_self_heal_tests {
             .expect("query repaired index");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("autohealneedle"));
+    }
+
+    #[test]
+    fn no_refresh_refuses_missing_assets_without_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let before_db = std::fs::read(&db_path).expect("read canonical db");
+
+        let err = ensure_lexical_assets_for_search_no_refresh(data_dir, &db_path, &index_path)
+            .expect_err("no-refresh must fail when lexical assets are missing");
+
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, CliErrorKind::LexicalRebuild.kind_str());
+        assert!(err.message.contains("--no-refresh refused search"));
+        assert_eq!(
+            std::fs::read(&db_path).expect("read unchanged db"),
+            before_db
+        );
+        assert!(!crate::search::tantivy::searchable_index_exists(
+            &index_path
+        ));
+    }
+
+    #[test]
+    fn no_refresh_refuses_stale_assets_without_repairing_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild");
+        let before_checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("read checkpoint")
+            .expect("checkpoint present");
+
+        seed_search_db_at(
+            &db_path,
+            "stale-no-refresh-needle",
+            "stale-no-refresh-conversation",
+        );
+        let err = ensure_lexical_assets_for_search_no_refresh(data_dir, &db_path, &index_path)
+            .expect_err("no-refresh must fail when the canonical DB changed");
+
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, CliErrorKind::LexicalRebuild.kind_str());
+        assert!(err.message.contains("storage fingerprint"));
+        let after_checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("read unchanged checkpoint")
+            .expect("checkpoint remains present");
+        assert_eq!(after_checkpoint, before_checkpoint);
+    }
+
+    #[test]
+    fn no_refresh_refuses_active_index_run_without_waiting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild");
+        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
+
+        let err = ensure_lexical_assets_for_search_no_refresh(data_dir, &db_path, &index_path)
+            .expect_err("no-refresh must refuse an active index run");
+
+        assert_eq!(err.code, 7);
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
+        assert!(err.message.contains("stable lexical snapshot"));
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("never waits"))
+        );
     }
 
     #[test]
@@ -19614,6 +19780,7 @@ fn run_cli_search(
     explain: bool,
     dry_run: bool,
     timeout_ms: Option<u64>,
+    no_refresh: bool,
     highlight: bool,
     source: Option<String>,
     sessions_from: Option<String>,
@@ -19749,14 +19916,18 @@ fn run_cli_search(
         return Ok(());
     }
 
-    let search_self_heal = ensure_lexical_assets_for_search(
-        &data_dir,
-        &db_path,
-        &index_path,
-        timeout_ms,
-        start_time,
-        dry_run,
-    )?;
+    let search_self_heal = if no_refresh {
+        ensure_lexical_assets_for_search_no_refresh(&data_dir, &db_path, &index_path)?
+    } else {
+        ensure_lexical_assets_for_search(
+            &data_dir,
+            &db_path,
+            &index_path,
+            timeout_ms,
+            start_time,
+            dry_run,
+        )?
+    };
     if search_self_heal.action != "skipped" {
         tracing::info!(
             action = search_self_heal.action,
@@ -91323,18 +91494,43 @@ mod query_stdin_tests {
             let cli = Cli::try_parse_from(["cass", "search", "--query-stdin", "--json"])
                 .expect("stdin query should not require positional query");
             let Some(Commands::Search {
-                query, query_stdin, ..
+                query,
+                query_stdin,
+                no_refresh,
+                ..
             }) = cli.command
             else {
                 panic!("expected search command");
             };
             assert!(query.is_none());
             assert!(query_stdin);
+            assert!(!no_refresh);
+
+            let read_only =
+                Cli::try_parse_from(["cass", "search", "--query-stdin", "--no-refresh"])
+                    .expect("--no-refresh should parse");
+            let Some(Commands::Search { no_refresh, .. }) = read_only.command else {
+                panic!("expected read-only search command");
+            };
+            assert!(no_refresh);
 
             let conflict =
                 Cli::try_parse_from(["cass", "search", "private phrase", "--query-stdin"])
                     .expect_err("positional query and stdin query should conflict");
             assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+            let refresh_conflict = Cli::try_parse_from([
+                "cass",
+                "search",
+                "private phrase",
+                "--no-refresh",
+                "--refresh",
+            ])
+            .expect_err("--no-refresh and --refresh should conflict");
+            assert_eq!(
+                refresh_conflict.kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
         });
     }
 }
