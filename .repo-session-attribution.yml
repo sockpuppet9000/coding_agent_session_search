@@ -1,0 +1,11 @@
+format: repo-session-attribution-manifest
+format_version: 2
+
+sessions:
+  - kind: chatgpt
+    interaction: write
+    scope:
+      - FORK_BACKLOG.md
+      - FORK_STATUS.md
+    account: openai:seitzandreas
+    conversation_uuid: 6a16d624-788c-83eb-8f85-bc9d55e750f2
