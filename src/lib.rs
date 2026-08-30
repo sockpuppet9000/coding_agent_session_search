@@ -24523,9 +24523,16 @@ struct DoctorRootCauseIncident {
 struct DoctorDatabaseIntegrityProbe {
     quick_check_status: String,
     integrity_check_diagnostics: Vec<String>,
+    full_integrity_check_deferred_reason: Option<String>,
 }
 
 const DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT: usize = 20;
+/// Do not start a synchronous full-page integrity walk on a large archive DB
+/// by default. The probe is read-only, but frankensqlite's page walk can take
+/// hours on multi-gigabyte databases and cannot be cancelled from the calling
+/// thread. `quick_check(1)` still runs; archive-control can additionally bound
+/// the whole CASS process when it needs a machine-level deadline.
+const DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 const DOCTOR_ANOMALY_POLICY_TABLE: &[DoctorAnomalyPolicy] = &[
     DoctorAnomalyPolicy {
@@ -24755,6 +24762,7 @@ fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
 
 fn doctor_database_integrity_probe(
     conn: &frankensqlite::Connection,
+    db_path: &Path,
 ) -> Result<DoctorDatabaseIntegrityProbe, String> {
     use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
@@ -24765,40 +24773,103 @@ fn doctor_database_integrity_probe(
         .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
 
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
-    let integrity_check_diagnostics = if quick_check_ok {
-        let integrity_sql =
-            format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
-        let rows = conn
-            .query(&integrity_sql)
-            .map_err(|err| format!("running PRAGMA integrity_check: {err}"))?;
-        let mut diagnostics = Vec::new();
-        for row in rows {
-            let detail: String = row
-                .get_typed(0)
-                .map_err(|err| format!("reading PRAGMA integrity_check output: {err}"))?;
-            let detail = detail.trim();
-            if detail.eq_ignore_ascii_case("ok") || detail.is_empty() {
-                continue;
+    let full_integrity_check_deferred_reason = quick_check_ok
+        .then(|| doctor_franken_deep_integrity_skip_reason(db_path))
+        .flatten();
+    let integrity_check_diagnostics =
+        if quick_check_ok && full_integrity_check_deferred_reason.is_none() {
+            let integrity_sql =
+                format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
+            let rows = conn
+                .query(&integrity_sql)
+                .map_err(|err| format!("running PRAGMA integrity_check: {err}"))?;
+            let mut diagnostics = Vec::new();
+            for row in rows {
+                let detail: String = row
+                    .get_typed(0)
+                    .map_err(|err| format!("reading PRAGMA integrity_check output: {err}"))?;
+                let detail = detail.trim();
+                if detail.eq_ignore_ascii_case("ok") || detail.is_empty() {
+                    continue;
+                }
+                diagnostics.push(detail.to_string());
+                if diagnostics.len() >= DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT {
+                    break;
+                }
             }
-            diagnostics.push(detail.to_string());
-            if diagnostics.len() >= DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT {
-                break;
-            }
-        }
-        diagnostics
-    } else {
-        Vec::new()
-    };
+            diagnostics
+        } else {
+            Vec::new()
+        };
 
     Ok(DoctorDatabaseIntegrityProbe {
         quick_check_status,
         integrity_check_diagnostics,
+        full_integrity_check_deferred_reason,
     })
 }
 
+fn doctor_franken_deep_integrity_skip_reason_for_bytes(bundle_bytes: u64) -> Option<String> {
+    (bundle_bytes > DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES).then(|| {
+        format!(
+            "frankensqlite_full_page_integrity_probe_deferred: archive bundle is {bundle_bytes} bytes, above the bounded doctor limit of {DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES} bytes"
+        )
+    })
+}
+
+fn doctor_franken_deep_integrity_skip_reason(db_path: &Path) -> Option<String> {
+    let main = match std::fs::symlink_metadata(db_path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+        Ok(_) => {
+            return Some(
+                "frankensqlite_full_page_integrity_probe_deferred: archive path is not a regular file"
+                    .to_string(),
+            );
+        }
+        Err(err) => {
+            return Some(format!(
+                "frankensqlite_full_page_integrity_probe_deferred: archive size is unavailable ({err})"
+            ));
+        }
+    };
+
+    let mut bundle_bytes = main;
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    match std::fs::symlink_metadata(&wal_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let Some(total) = bundle_bytes.checked_add(metadata.len()) else {
+                return Some(
+                    "frankensqlite_full_page_integrity_probe_deferred: archive bundle size overflowed"
+                        .to_string(),
+                );
+            };
+            bundle_bytes = total;
+        }
+        Ok(_) => {
+            return Some(
+                "frankensqlite_full_page_integrity_probe_deferred: WAL sidecar is not a regular file"
+                    .to_string(),
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Some(format!(
+                "frankensqlite_full_page_integrity_probe_deferred: WAL size is unavailable ({err})"
+            ));
+        }
+    }
+
+    doctor_franken_deep_integrity_skip_reason_for_bytes(bundle_bytes)
+}
+
 impl DoctorDatabaseIntegrityProbe {
-    fn is_ok(&self) -> bool {
+    fn quick_check_ok(&self) -> bool {
         self.quick_check_status.trim().eq_ignore_ascii_case("ok")
+    }
+
+    fn is_ok(&self) -> bool {
+        self.quick_check_ok()
+            && self.full_integrity_check_deferred_reason.is_none()
             && self.integrity_check_diagnostics.is_empty()
     }
 
@@ -24811,7 +24882,7 @@ impl DoctorDatabaseIntegrityProbe {
     }
 
     fn diagnostic_summary(&self) -> String {
-        if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+        if !self.quick_check_ok() {
             return self.quick_check_status.trim().to_string();
         }
         let mut summary = self
@@ -24836,6 +24907,87 @@ impl DoctorDatabaseIntegrityProbe {
     }
 }
 
+#[cfg(test)]
+mod doctor_database_integrity_probe_tests {
+    use super::{
+        DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES, DoctorDatabaseIntegrityProbe,
+        doctor_franken_deep_integrity_skip_reason,
+        doctor_franken_deep_integrity_skip_reason_for_bytes,
+    };
+
+    #[test]
+    fn large_database_probe_is_not_reported_as_fully_ok() {
+        let probe = DoctorDatabaseIntegrityProbe {
+            quick_check_status: "ok".to_string(),
+            integrity_check_diagnostics: Vec::new(),
+            full_integrity_check_deferred_reason: Some(
+                "frankensqlite_full_page_integrity_probe_deferred: test".to_string(),
+            ),
+        };
+
+        assert!(!probe.is_ok());
+        assert!(DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES > 0);
+    }
+
+    #[test]
+    fn integrity_size_cap_is_strictly_greater_than_the_limit() {
+        assert!(
+            doctor_franken_deep_integrity_skip_reason_for_bytes(
+                DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES
+            )
+            .is_none()
+        );
+        let reason = doctor_franken_deep_integrity_skip_reason_for_bytes(
+            DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES + 1,
+        )
+        .expect("one byte above the bounded budget must defer the full-page PRAGMA");
+        assert!(reason.contains("full_page_integrity_probe_deferred"));
+    }
+
+    #[test]
+    fn integrity_size_cap_counts_the_wal_bundle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("archive.db");
+        let file = std::fs::File::create(&path).expect("create database fixture");
+
+        file.set_len(DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES - 1)
+            .expect("set main database size");
+        assert!(doctor_franken_deep_integrity_skip_reason(&path).is_none());
+
+        let wal_path = temp.path().join("archive.db-wal");
+        std::fs::File::create(&wal_path)
+            .and_then(|file| file.set_len(2))
+            .expect("set WAL size");
+        let reason = doctor_franken_deep_integrity_skip_reason(&path)
+            .expect("main database plus WAL above the budget must defer the probe");
+        assert!(reason.contains("268435457 bytes"));
+    }
+
+    #[test]
+    fn quick_check_failure_is_not_hidden_by_skip_state() {
+        let probe = DoctorDatabaseIntegrityProbe {
+            quick_check_status: "database disk image is malformed".to_string(),
+            integrity_check_diagnostics: Vec::new(),
+            full_integrity_check_deferred_reason: None,
+        };
+
+        assert!(!probe.is_ok());
+        assert_eq!(probe.failed_pragma_name(), "quick_check");
+    }
+
+    #[test]
+    fn deferred_integrity_is_not_classified_as_corruption() {
+        assert_eq!(
+            super::doctor_anomaly_for_check(
+                "database",
+                "warn",
+                "frankensqlite_full_page_integrity_probe_deferred: bounded probe skipped",
+            ),
+            super::DoctorAnomaly::RepairBlocked
+        );
+    }
+}
+
 fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAnomaly {
     if status == "pass" {
         return DoctorAnomaly::Healthy;
@@ -24853,7 +25005,9 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
             }
         }
         "database" => {
-            if message.contains("quick_check") || message.contains("integrity_check") {
+            if message.contains("full_page_integrity_probe_deferred") {
+                DoctorAnomaly::RepairBlocked
+            } else if message.contains("quick_check") || message.contains("integrity_check") {
                 DoctorAnomaly::ArchiveDbCorrupt
             } else {
                 DoctorAnomaly::ArchiveDbUnreadable
@@ -68224,7 +68378,7 @@ pub(crate) fn run_doctor_impl(
                 if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
                     db_conversations = Some(conv_count.max(0) as usize);
                     db_messages = Some(msg_count.max(0) as usize);
-                    match doctor_database_integrity_probe(&conn) {
+                    match doctor_database_integrity_probe(&conn, &db_path) {
                         Ok(integrity) if integrity.is_ok() => {
                             db_ok = true;
                             add_check!(
@@ -68264,6 +68418,24 @@ pub(crate) fn run_doctor_impl(
                                     );
                                 }
                             }
+                        }
+                        Ok(integrity)
+                            if integrity.full_integrity_check_deferred_reason.is_some() =>
+                        {
+                            db_ok = true;
+                            let reason = integrity
+                                .full_integrity_check_deferred_reason
+                                .as_deref()
+                                .unwrap_or("full-page integrity probe was deferred");
+                            add_check!(
+                                "database",
+                                "warn",
+                                format!(
+                                    "Database quick_check passed ({} conversations, {} messages); {reason}",
+                                    conv_count, msg_count
+                                ),
+                                false
+                            );
                         }
                         Ok(integrity) => {
                             let failed_pragma = integrity.failed_pragma_name();
