@@ -509,7 +509,9 @@ pub enum Commands {
         /// Read the UTF-8 query from stdin instead of exposing it in argv.
         /// This is intended for local wrappers and control-plane adapters.
         /// The input is bounded to 64 KiB and terminal line endings are
-        /// ignored. The query is never echoed by the CLI.
+        /// ignored. The query is not echoed in transport diagnostics. Normal
+        /// robot result envelopes retain their existing `query` field, so
+        /// callers must treat stdout as sensitive and avoid persisting it.
         #[arg(long, default_value_t = false)]
         query_stdin: bool,
         /// Filter by agent slug (can be specified multiple times)
