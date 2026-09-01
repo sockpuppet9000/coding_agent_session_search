@@ -16003,6 +16003,20 @@ pub fn run_index(
         })?;
     }
 
+    // #319/#321: the remaining post-publish work includes both the optional
+    // fallback-FTS shadow repair below and the final WAL checkpoint in
+    // `close_storage_after_index`.  Neither operation can reliably advance
+    // the ordinary progress atomics: the repair may rebuild a large shadow in
+    // one synchronous transaction, while the close performs a synchronous
+    // frankensqlite close/checkpoint.  Mark the whole bounded finalization
+    // window before entering either operation so the stall watchdog applies
+    // its finalize-class grace instead of aborting a healthy large run at the
+    // ordinary 300-second threshold.  The flag remains bounded by the same
+    // `index_finalize_abort_threshold` policy; it is not a never-abort switch.
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.finalizing.store(true, Ordering::Relaxed);
+    }
+
     let fallback_fts_archive_fingerprint = skipped_noop_full_scan_authoritative_rebuild
         .then_some(
             initial_matching_lexical_checkpoint
@@ -16423,20 +16437,6 @@ pub fn run_index(
         return Ok(());
     }
 
-    // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
-    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
-    // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
-    // and cannot report progress. On a large corpus (the report: ~1.1 GB /
-    // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
-    // Signal the stall watchdog that we have entered that finalize window so it
-    // does not misread the quiescent, phase-0, current==total state as a #297
-    // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
-    // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
-    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
-    // so a genuinely stuck finalize is still aborted.
-    if let Some(progress) = opts.progress.as_ref() {
-        progress.finalizing.store(true, Ordering::Relaxed);
-    }
     close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
