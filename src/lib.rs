@@ -100569,8 +100569,9 @@ const INDEX_STALL_HINT: &str = concat!(
     "and finalize phases expose their own counters and are report-only; native HNSW construction is explicitly ",
     "labelled but opaque. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; set ",
     "CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only. ",
-    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
-    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
+    "If `finalizing` is true in the diagnostics the indexer is inside post-publish fallback-FTS maintenance or ",
+    "the final WAL checkpoint of a large deferred bulk-ingest WAL (slow on macOS); ",
+    "CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
     "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
 );
 
@@ -100629,16 +100630,17 @@ fn index_stall_abort_threshold(
 /// Bounded-but-generous abort grace for the post-publish *finalize* window
 /// (#319/#321).
 ///
-/// A non-watch, non-semantic `cass index --full` ends by checkpointing the
-/// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
-/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
-/// on the indexer thread and cannot advance the progress atomics. On a large
-/// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
-/// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
-/// slow. The generic finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`,
-/// default 300 s) misreads that active checkpoint as a #297 wedge and kills the
-/// process with `exit(70)` mid-checkpoint — stranding the un-truncated WAL and
-/// leaving the DB malformed to stock SQLite (#296/#321).
+/// A non-watch, non-semantic `cass index --full` can spend its post-publish
+/// finalize window repairing a fallback FTS5 shadow and then checkpointing the
+/// deferred bulk-ingest WAL inside `close_storage_after_index`. Both are
+/// synchronous, `!Send` frankensqlite work on the indexer thread and cannot
+/// advance the ordinary progress atomics. On a large corpus (the #319 report:
+/// a ~1.1 GB / ~290k-frame WAL) these operations legitimately take minutes,
+/// especially on macOS where Darwin fsync/flock is slow. The generic
+/// finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`, default 300 s) misreads
+/// that active work as a #297 wedge and kills the process with `exit(70)`
+/// mid-maintenance — potentially stranding the WAL and leaving the DB malformed
+/// to stock SQLite (#296/#321).
 ///
 /// While the indexer signals `IndexingProgress::finalizing`, the watchdog uses
 /// this larger threshold instead, so a slow-but-progressing final checkpoint
@@ -100711,8 +100713,9 @@ struct IndexStallWatchdog {
     threshold: Option<Duration>,
     abort_threshold: Option<Duration>,
     /// Larger abort grace used only while `IndexingProgress::finalizing` is set
-    /// (the post-publish WAL-checkpoint window). `None` = never abort during
-    /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
+    /// (the post-publish fallback-FTS/WAL finalization window). `None` = never
+    /// abort during finalize (report-only). See `index_finalize_abort_threshold`
+    /// (#319/#321).
     finalize_abort_threshold: Option<Duration>,
     abort_policy: IndexStallAbortPolicy,
     /// True when supervising a long-lived `cass index --watch` daemon. In
@@ -100985,17 +100988,17 @@ impl IndexStallWatchdog {
             || pre_index_lexical_wedge
             || finalize_wedge;
         // #319/#321: while the indexer signals `finalizing`, the phase-0 /
-        // current==total / quiescent shape is the post-publish WAL-checkpoint
-        // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
-        // frankensqlite call on the indexer thread that cannot advance the
-        // progress atomics, so it can only be recognised via this flag. Give it
-        // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
-        // of a large deferred WAL completes instead of being killed mid-write
-        // (which strands the WAL and leaves the DB malformed). A genuine phase-2
-        // wedge (phase_code == 2) is unaffected and still aborts at the normal
-        // threshold. Because the checkpoint blocks a single thread and cannot be
-        // heartbeated, the bound is the only liveness guard: once it elapses the
-        // finalize is aborted too.
+        // current==total / quiescent shape is post-publish fallback-FTS/WAL
+        // maintenance, not a #297 wedge. These operations are synchronous,
+        // `!Send` frankensqlite work on the indexer thread that cannot advance
+        // the progress atomics, so they can only be recognised via this flag.
+        // Give them the larger `finalize_abort_threshold` so slow-but-active
+        // maintenance completes instead of being killed mid-write (which can
+        // strand the WAL or leave the DB malformed). A genuine phase-2 wedge
+        // (phase_code == 2) is unaffected and still aborts at the normal
+        // threshold. Because this work blocks a single thread and cannot be
+        // heartbeated, the bound is the only liveness guard: once it elapses
+        // the finalize is aborted too.
         // #366: the finalize grace also applies while a staged lexical
         // rebuild is active but its pipeline has not produced the first page
         // yet (`is_rebuilding` set, quiescent, current >= total). That

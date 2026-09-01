@@ -1028,17 +1028,14 @@ pub struct IndexingProgress {
     // the independently measured semantic pipeline stages above.
     pub phase: AtomicUsize,
     pub is_rebuilding: AtomicBool,
-    /// Set by `run_index` while it is inside the post-publish finalize window —
-    /// specifically `close_storage_after_index`, which runs the (deferred,
-    /// possibly multi-GB) bulk-ingest WAL checkpoint via a synchronous,
-    /// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
-    /// indexer thread. That checkpoint cannot report progress and, on a large
-    /// corpus (esp. macOS, where Darwin fsync/flock is slow), legitimately
-    /// takes minutes. The stall watchdog reads this flag so it does not misread
-    /// that active checkpoint as a #297 finalize wedge and kill the process
-    /// (exit 70) mid-write — which strands the un-truncated WAL and leaves the
-    /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
-    /// bounded: see `index_finalize_abort_threshold` (#319).
+    /// Set by `run_index` while it is inside the bounded post-publish finalize
+    /// window — fallback-FTS maintenance and `close_storage_after_index`,
+    /// which runs the (deferred, possibly multi-GB) bulk-ingest WAL checkpoint
+    /// via synchronous `!Send` frankensqlite work on the indexer thread. Either
+    /// operation can be unable to report progress for minutes. The stall
+    /// watchdog reads this flag so it does not misread active post-publish work
+    /// as a #297 finalize wedge and kill the process (exit 70) mid-write.
+    /// Liveness is still bounded: see `index_finalize_abort_threshold` (#319).
     pub finalizing: AtomicBool,
     /// gh373 third variant (bead oeu5a): true while the streaming consumer is
     /// inside `persist::persist_conversations_batched*` for one ingest batch.
@@ -1476,10 +1473,10 @@ impl IndexingProgress {
             "discovered_agents": agents,
             "agent_names": agent_names,
             "is_rebuilding": is_rebuilding,
-            // #319: true while the indexer is inside the post-publish finalize
-            // WAL checkpoint (close_storage_after_index). A quiescent, phase-0,
-            // current==total snapshot with `finalizing: true` is an active
-            // final checkpoint, NOT a #297 wedge.
+            // #319: true while the indexer is inside post-publish fallback-FTS
+            // maintenance or the WAL checkpoint (close_storage_after_index).
+            // A quiescent, phase-0, current==total snapshot with
+            // `finalizing: true` is active finalization, NOT a #297 wedge.
             "finalizing": finalizing,
             // gh373/oeu5a: true while one ingest batch is inside batched
             // persistence (redaction/map + writer transaction). A phase-2
@@ -2007,6 +2004,7 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
 
     progress.phase.store(0, Ordering::Relaxed);
     progress.is_rebuilding.store(false, Ordering::Relaxed);
+    progress.finalizing.store(false, Ordering::Relaxed);
     progress
         .rebuild_pipeline_queue_depth
         .store(0, Ordering::Relaxed);
@@ -2100,6 +2098,25 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
     {
         staged_shard_build_reason.clear();
     }
+}
+
+/// Mark synchronous work after the lexical generation/checkpoint has been
+/// published. This covers the optional fallback-FTS repair as well as the
+/// final WAL/storage close. Both can block without advancing the ordinary
+/// progress counters, so the stall watchdog must apply its bounded finalize
+/// grace. Resetting the progress state clears the marker on normal exits.
+fn begin_post_publish_finalize_progress(progress: Option<&Arc<IndexingProgress>>) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    // Publish the protection flag before the phase shape so a watchdog poll
+    // cannot observe the new finalize phase without the extended grace.
+    progress.finalizing.store(true, Ordering::Relaxed);
+    progress.total_is_final.store(true, Ordering::Relaxed);
+    progress
+        .phase
+        .store(INDEX_PHASE_PREPARING, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -16003,20 +16020,6 @@ pub fn run_index(
         })?;
     }
 
-    // #319/#321: the remaining post-publish work includes both the optional
-    // fallback-FTS shadow repair below and the final WAL checkpoint in
-    // `close_storage_after_index`.  Neither operation can reliably advance
-    // the ordinary progress atomics: the repair may rebuild a large shadow in
-    // one synchronous transaction, while the close performs a synchronous
-    // frankensqlite close/checkpoint.  Mark the whole bounded finalization
-    // window before entering either operation so the stall watchdog applies
-    // its finalize-class grace instead of aborting a healthy large run at the
-    // ordinary 300-second threshold.  The flag remains bounded by the same
-    // `index_finalize_abort_threshold` policy; it is not a never-abort switch.
-    if let Some(progress) = opts.progress.as_ref() {
-        progress.finalizing.store(true, Ordering::Relaxed);
-    }
-
     let fallback_fts_archive_fingerprint = skipped_noop_full_scan_authoritative_rebuild
         .then_some(
             initial_matching_lexical_checkpoint
@@ -16024,6 +16027,12 @@ pub fn run_index(
                 .as_deref(),
         )
         .flatten();
+    if should_repair_fallback_fts_after_full_index_run(opts.full, canonical_only_full_rebuild) {
+        // This repair can synchronously rebuild an FTS5 shadow over millions
+        // of messages. Mark it before entering the call, not only before the
+        // later WAL/storage close.
+        begin_post_publish_finalize_progress(opts.progress.as_ref());
+    }
     if let Some(repair) = repair_fallback_fts_after_full_index_run(
         &storage,
         &opts.db_path,
@@ -16102,11 +16111,12 @@ pub fn run_index(
         );
     }
 
-    reset_progress_to_idle(opts.progress.as_ref());
-
     if opts.watch || opts.watch_once_paths.is_some() {
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+        // Keep non-watch progress active until the synchronous final DB/WAL
+        // close has returned; only a watch session becomes idle here.
+        reset_progress_to_idle(opts.progress.as_ref());
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
         let watch_once_mode = opts
             .watch_once_paths
@@ -16437,6 +16447,10 @@ pub fn run_index(
         return Ok(());
     }
 
+    // The final WAL checkpoint is covered by the same post-publish marker that
+    // was set before fallback-FTS maintenance above. This call remains bounded
+    // by `index_finalize_abort_threshold`; it is not a never-abort switch.
+    begin_post_publish_finalize_progress(opts.progress.as_ref());
     close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
@@ -33139,6 +33153,29 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn post_publish_finalize_progress_marker_resets_cleanly() {
+        let progress = Arc::new(IndexingProgress::default());
+
+        begin_post_publish_finalize_progress(Some(&progress));
+        assert!(
+            progress
+                .finalizing
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(
+            progress.phase.load(std::sync::atomic::Ordering::Relaxed),
+            INDEX_PHASE_PREPARING
+        );
+
+        reset_progress_to_idle(Some(&progress));
+        assert!(
+            !progress
+                .finalizing
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
 
     /// #366: waiting↔waiting park flaps are scheduler churn a livelocked
     /// pipeline can sustain forever; they must not reset the stall clock.
