@@ -307,6 +307,23 @@ cass search "how to handle user login" --mode semantic --robot
 cass search "auth error handling" --mode hybrid --robot
 ```
 
+### Private query transport
+
+Integrations that must not expose a private query in the process list, shell
+history, or a proxy access log can feed it on standard input instead of using
+the positional `QUERY` argument:
+
+```bash
+printf '%s\n' 'authentication error' \
+  | cass search --query-stdin --mode lexical --robot --no-maintenance
+```
+
+`--query-stdin` accepts one bounded UTF-8 payload (up to 64 KiB), strips a
+terminal CR/LF, rejects empty/NUL-containing input, and never echoes the query.
+The normal positional form remains available for interactive use. This
+transport protects the query from `argv`; callers must still apply their own
+authentication, authorization, no-store, and result-output policy.
+
 ### 🎯 Advanced Search Features
 - **Wildcard Patterns**: Full glob-style pattern support:
   - `foo*` - Prefix match (finds "foobar", "foo123")
